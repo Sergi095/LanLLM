@@ -1,0 +1,541 @@
+"""Discover the LAN pool, elect a Ray head, and expose one API on every node."""
+
+import argparse
+import csv
+import fcntl
+import http.server
+import json
+import os
+import socket
+import socketserver
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+
+from lanllm.launch import (
+    Settings,
+    ray_command,
+    runtime_environment,
+    vllm_command,
+    wait_for_gpu_pool,
+)
+
+
+def local_ip_for(peer_ip: str) -> str:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.connect((peer_ip, 9))
+        return sock.getsockname()[0]
+
+
+def interface_for(ip: str) -> str:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        for _, name in socket.if_nameindex():
+            try:
+                address = fcntl.ioctl(
+                    sock.fileno(), 0x8915, struct.pack("256s", name.encode()[:15])
+                )[20:24]
+            except OSError:
+                continue
+            if socket.inet_ntoa(address) == ip:
+                return name
+    raise ValueError(f"No network interface owns {ip}")
+
+
+def gpu_rows() -> list[dict[str, str]]:
+    fields = (
+        "index,name,memory.total,memory.used,utilization.gpu,temperature.gpu,power.draw"
+    )
+    result = subprocess.run(
+        ["nvidia-smi", f"--query-gpu={fields}", "--format=csv,noheader,nounits"],
+        check=True,
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+    keys = ("index", "name", "total_mib", "used_mib", "util", "temp", "watts")
+    return [
+        dict(zip(keys, (cell.strip() for cell in row), strict=True))
+        for row in csv.reader(result.stdout.splitlines())
+    ]
+
+
+def ram_gib() -> tuple[float, float]:
+    values = {}
+    with open("/proc/meminfo", encoding="ascii") as source:
+        for line in source:
+            key, _, value = line.partition(":")
+            if key in {"MemTotal", "MemAvailable"}:
+                values[key] = int(value.split()[0]) / 1024 / 1024
+    return values["MemTotal"], values["MemAvailable"]
+
+
+@dataclass(frozen=True)
+class Config:
+    node_ip: str
+    peer_ips: tuple[str, ...]
+    network_interface: str
+    local_gpus: int
+    total_gpus: int
+    model_id: str
+    ray_port: int
+    api_port: int
+    control_port: int
+    env: dict[str, str]
+
+    @classmethod
+    def from_environment(cls, env: dict[str, str]) -> "Config":
+        peers = tuple(
+            part.strip() for part in env.get("PEER_IPS", "").split(",") if part.strip()
+        )
+        if not peers:
+            raise ValueError("PEER_IPS must list every LAN node, including this one")
+        if len(set(peers)) != len(peers):
+            raise ValueError("PEER_IPS contains duplicate addresses")
+        node_ip = env.get("NODE_IP", "").strip() or local_ip_for(peers[0])
+        if node_ip not in peers:
+            raise ValueError(
+                f"Detected NODE_IP={node_ip}, which is absent from PEER_IPS"
+            )
+        interface = env.get("NETWORK_INTERFACE", "").strip() or interface_for(node_ip)
+        rows = gpu_rows()
+        if not rows:
+            raise ValueError("No NVIDIA GPUs are visible inside the container")
+        local_gpus = len(rows)
+        total_gpus = int(env.get("TOTAL_GPUS", "3"))
+        if total_gpus < local_gpus:
+            raise ValueError("TOTAL_GPUS is less than this node's GPU count")
+        model_id = env.get("MODEL_ID", "").strip()
+        if not model_id:
+            raise ValueError("MODEL_ID must be set")
+        return cls(
+            node_ip=node_ip,
+            peer_ips=peers,
+            network_interface=interface,
+            local_gpus=local_gpus,
+            total_gpus=total_gpus,
+            model_id=model_id,
+            ray_port=int(env.get("RAY_PORT", "6379")),
+            api_port=int(env.get("API_PORT", "8000")),
+            control_port=int(env.get("CONTROL_PORT", "8501")),
+            env=env,
+        )
+
+    def settings(self, role: str, leader_ip: str, partition: str = "") -> Settings:
+        values = dict(self.env)
+        values.update(
+            NODE_IP=self.node_ip,
+            HEAD_IP=leader_ip,
+            NETWORK_INTERFACE=self.network_interface,
+            LOCAL_GPUS=str(self.local_gpus),
+            TOTAL_GPUS=str(self.total_gpus),
+            API_HOST="0.0.0.0",
+            API_PORT=str(self.api_port),
+            RAY_PORT=str(self.ray_port),
+            LAYER_PARTITION=partition,
+        )
+        return Settings.from_environment(role, values)
+
+
+class State:
+    def __init__(self, config: Config):
+        self.config = config
+        self.role = "candidate"
+        self.leader_ip = ""
+        self.lock = threading.Lock()
+
+    def set(self, role: str, leader_ip: str) -> None:
+        with self.lock:
+            self.role = role
+            self.leader_ip = leader_ip
+        print(
+            f"LanLLM: {role} on {self.config.node_ip}; leader {leader_ip}", flush=True
+        )
+
+    def identity(self) -> dict:
+        with self.lock:
+            role, leader_ip = self.role, self.leader_ip
+        return {
+            "node_ip": self.config.node_ip,
+            "role": role,
+            "leader_ip": leader_ip,
+        }
+
+    def snapshot(self) -> dict:
+        total_ram, available_ram = ram_gib()
+        return self.identity() | {
+            "model_id": self.config.model_id,
+            "gpus": gpu_rows(),
+            "cpus": os.cpu_count(),
+            "ram_total_gib": round(total_ram, 1),
+            "ram_available_gib": round(available_ram, 1),
+        }
+
+
+class ControlHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        if self.path == "/health":
+            payload = json.dumps(self.server.state.identity()).encode()
+        elif self.path == "/state":
+            payload = json.dumps(self.server.state.snapshot()).encode()
+        else:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, format: str, *args: object) -> None:
+        return
+
+
+class ControlServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, state: State):
+        self.state = state
+        super().__init__(
+            (state.config.node_ip, state.config.control_port), ControlHandler
+        )
+
+
+def query_node(
+    ip: str, port: int, timeout: float = 1, *, full: bool = False
+) -> dict | None:
+    path = "state" if full else "health"
+    try:
+        with urllib.request.urlopen(
+            f"http://{ip}:{port}/{path}", timeout=timeout
+        ) as response:
+            return json.load(response)
+    except (OSError, ValueError, urllib.error.URLError):
+        return None
+
+
+def ip_key(ip: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in ip.split("."))
+
+
+def elect_leader(node_ip: str, peer_states: list[dict]) -> str:
+    leaders = [state["node_ip"] for state in peer_states if state["role"] == "leader"]
+    if leaders:
+        return min(leaders, key=ip_key)
+    candidates = [node_ip] + [state["node_ip"] for state in peer_states]
+    return min(candidates, key=ip_key)
+
+
+def allocate_layers(layer_count: int, memory_mib: list[int]) -> list[int]:
+    if layer_count < len(memory_mib) or not memory_mib:
+        raise ValueError("Model needs at least one layer per GPU")
+    # Leave extra room on small cards for embeddings, runtime, and KV cache.
+    weights = [
+        max(memory - (3072 if memory < 10240 else 2048), 1024) for memory in memory_mib
+    ]
+    remaining = layer_count - len(weights)
+    raw = [remaining * weight / sum(weights) for weight in weights]
+    layers = [1 + int(value) for value in raw]
+    extras = layer_count - sum(layers)
+    order = sorted(range(len(raw)), key=lambda index: raw[index] % 1, reverse=True)
+    for index in order[:extras]:
+        layers[index] += 1
+    return layers
+
+
+def resolve_partition(config: Config, leader_ip: str) -> str:
+    requested = config.env.get("LAYER_PARTITION", "").strip()
+    if requested != "auto":
+        return requested
+    ordered_ips = [leader_ip] + [ip for ip in config.peer_ips if ip != leader_ip]
+    while True:
+        states = [query_node(ip, config.control_port, full=True) for ip in ordered_ips]
+        if all(state is not None for state in states):
+            memory = [
+                int(gpu["total_mib"]) for state in states for gpu in state["gpus"]
+            ]
+            if len(memory) == config.total_gpus:
+                break
+        print("Waiting for GPU inventory to calculate layer partition", flush=True)
+        time.sleep(5)
+    from huggingface_hub import hf_hub_download
+
+    path = hf_hub_download(
+        repo_id=config.model_id,
+        filename="config.json",
+        revision=config.env.get("HF_REVISION") or None,
+        token=config.env.get("HF_TOKEN") or None,
+    )
+    with open(path, encoding="utf-8") as source:
+        model_config = json.load(source)
+    layer_count = model_config.get("num_hidden_layers")
+    if not isinstance(layer_count, int):
+        raise ValueError(
+            "Auto layer partition requires num_hidden_layers in config.json"
+        )
+    partition = ",".join(str(count) for count in allocate_layers(layer_count, memory))
+    print(f"Auto layer partition: {partition} for GPUs {memory} MiB", flush=True)
+    return partition
+
+
+class ProxyHandler(socketserver.BaseRequestHandler):
+    def handle(self) -> None:
+        try:
+            upstream = socket.create_connection(
+                (self.server.leader_ip, self.server.api_port), timeout=3
+            )
+        except OSError:
+            message = b"LanLLM leader is starting"
+            self.request.sendall(
+                b"HTTP/1.1 503 Service Unavailable\r\n"
+                + f"Content-Length: {len(message)}\r\n".encode()
+                + b"Connection: close\r\n\r\n"
+                + message
+            )
+            return
+        with upstream:
+            upstream.settimeout(None)
+
+            def copy(source: socket.socket, target: socket.socket) -> None:
+                try:
+                    while data := source.recv(65536):
+                        target.sendall(data)
+                except OSError:
+                    pass
+                try:
+                    target.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+
+            send = threading.Thread(
+                target=copy, args=(self.request, upstream), daemon=True
+            )
+            send.start()
+            copy(upstream, self.request)
+            send.join(timeout=1)
+
+
+class ProxyServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, config: Config, leader_ip: str):
+        self.leader_ip = leader_ip
+        self.api_port = config.api_port
+        super().__init__(("0.0.0.0", config.api_port), ProxyHandler)
+
+
+def stop_process(process: subprocess.Popen | None) -> None:
+    if process is None or process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
+def stop_ray() -> None:
+    subprocess.run(["ray", "stop", "--force"], check=False, timeout=30)
+
+
+def reachable(ip: str, port: int) -> bool:
+    try:
+        with socket.create_connection((ip, port), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+def lower_priority_leader(config: Config) -> str | None:
+    for ip in config.peer_ips:
+        if ip == config.node_ip or ip_key(ip) >= ip_key(config.node_ip):
+            continue
+        peer = query_node(ip, config.control_port)
+        if peer is not None and peer.get("role") == "leader":
+            return ip
+    return None
+
+
+def run_worker(config: Config, state: State, leader_ip: str) -> None:
+    state.set("worker", leader_ip)
+    settings = config.settings(
+        "worker", leader_ip, resolve_partition(config, leader_ip)
+    )
+    proxy = ProxyServer(config, leader_ip)
+    proxy_thread = threading.Thread(target=proxy.serve_forever, daemon=True)
+    proxy_thread.start()
+    process = None
+    failures = 0
+    try:
+        while True:
+            leader = query_node(leader_ip, config.control_port)
+            if leader is None or leader.get("role") != "leader":
+                failures += 1
+                if failures >= 3:
+                    return
+            else:
+                failures = 0
+            if process is not None and process.poll() is not None:
+                print(
+                    f"Ray worker exited with code {process.returncode}; retrying",
+                    flush=True,
+                )
+                process = None
+            if process is None and reachable(leader_ip, config.ray_port):
+                process = subprocess.Popen(
+                    ray_command(settings), env=runtime_environment(settings)
+                )
+            time.sleep(2)
+    finally:
+        stop_process(process)
+        stop_ray()
+        proxy.shutdown()
+        proxy.server_close()
+        proxy_thread.join(timeout=3)
+
+
+def run_leader(config: Config, state: State) -> None:
+    state.set("leader", config.node_ip)
+    settings = config.settings(
+        "head", config.node_ip, resolve_partition(config, config.node_ip)
+    )
+    server = None
+    try:
+        subprocess.run(
+            ray_command(settings), check=True, env=runtime_environment(settings)
+        )
+        while True:
+            try:
+                ready = wait_for_gpu_pool(
+                    settings,
+                    competing_leader=lambda: lower_priority_leader(config) is not None,
+                )
+            except TimeoutError as exc:
+                print(f"{exc}; waiting for nodes to join", flush=True)
+                continue
+            if not ready:
+                print("Another node won the leader election", flush=True)
+                return
+            server = subprocess.Popen(
+                vllm_command(settings), env=runtime_environment(settings)
+            )
+            while server.poll() is None:
+                other_leader = lower_priority_leader(config)
+                if other_leader is not None:
+                    print(f"Another leader won election at {other_leader}", flush=True)
+                    return
+                time.sleep(3)
+            print(f"vLLM exited with code {server.returncode}; restarting", flush=True)
+    finally:
+        stop_process(server)
+        stop_ray()
+
+
+def run(config: Config) -> None:
+    state = State(config)
+    control = ControlServer(state)
+    control_thread = threading.Thread(target=control.serve_forever, daemon=True)
+    control_thread.start()
+    print(
+        f"LanLLM node {config.node_ip} ({config.network_interface}), "
+        f"{config.local_gpus} local GPU(s)",
+        flush=True,
+    )
+    try:
+        # Give simultaneously started nodes time to announce candidacy.
+        time.sleep(3)
+        while True:
+            peers = [
+                peer
+                for ip in config.peer_ips
+                if ip != config.node_ip
+                if (peer := query_node(ip, config.control_port)) is not None
+            ]
+            leader_ip = elect_leader(config.node_ip, peers)
+            if leader_ip == config.node_ip:
+                run_leader(config, state)
+            else:
+                run_worker(config, state, leader_ip)
+            state.set("candidate", "")
+            time.sleep(2)
+    finally:
+        control.shutdown()
+        control.server_close()
+
+
+def format_status(states: list[dict], offline: list[str], api_port: int) -> str:
+    lines = ["LanLLM GPU pool", "=" * 109]
+    if states:
+        leaders = [state["node_ip"] for state in states if state["role"] == "leader"]
+        lines.append(
+            f"Model: {states[0]['model_id']}   Leader: {leaders[0] if leaders else 'starting'}"
+        )
+    lines.append(
+        f"{'Node / role':<25} {'GPU':<3} {'Name':<36} {'Temp':>5} "
+        f"{'Util':>5} {'VRAM used / total':>21} {'Power':>8}"
+    )
+    lines.append("-" * 109)
+    total_gpus = total_mib = used_mib = 0
+    for state in states:
+        for gpu in state["gpus"]:
+            total_gpus += 1
+            total_mib += int(gpu["total_mib"])
+            used_mib += int(gpu["used_mib"])
+            lines.append(
+                f"{state['node_ip'] + ' ' + state['role']:<25} "
+                f"{gpu['index']:<3} {gpu['name'][:36]:<36} "
+                f"{gpu['temp'] + ' C':>5} {gpu['util'] + '%':>5} "
+                f"{gpu['used_mib'] + ' / ' + gpu['total_mib'] + ' MiB':>21} "
+                f"{gpu['watts'] + ' W':>8}"
+            )
+    lines.append("=" * 109)
+    lines.append(
+        f"Pool: {total_gpus} GPU(s), {used_mib:,} / {total_mib:,} MiB VRAM used"
+    )
+    for state in states:
+        lines.append(
+            f"{state['node_ip']}: {state['cpus']} CPUs, "
+            f"{state['ram_available_gib']}/{state['ram_total_gib']} GiB RAM available, "
+            f"API http://{state['node_ip']}:{api_port}"
+        )
+    for ip in offline:
+        lines.append(f"{ip}: offline")
+    return "\n".join(lines)
+
+
+def status(config: Config) -> None:
+    states = []
+    offline = []
+    for ip in config.peer_ips:
+        response = query_node(ip, config.control_port, timeout=3, full=True)
+        if response is None:
+            offline.append(ip)
+        else:
+            states.append(response)
+    print(format_status(states, offline, config.api_port))
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="lanllm")
+    parser.add_argument("action", choices=("run", "status"))
+    args = parser.parse_args(argv)
+    try:
+        config = Config.from_environment(dict(os.environ))
+    except (ValueError, subprocess.CalledProcessError, FileNotFoundError) as exc:
+        parser.error(str(exc))
+    if args.action == "status":
+        status(config)
+    else:
+        run(config)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,14 +1,10 @@
 """Start a Ray GPU pool and serve any model supported by vLLM."""
 
-import argparse
 import os
 import re
-import shlex
-import subprocess
-import sys
 import time
 from dataclasses import dataclass
-from typing import Literal
+from typing import Callable, Literal
 
 
 @dataclass(frozen=True)
@@ -167,7 +163,9 @@ def runtime_environment(settings: Settings) -> dict[str, str]:
     return env
 
 
-def wait_for_gpu_pool(settings: Settings) -> None:
+def wait_for_gpu_pool(
+    settings: Settings, competing_leader: Callable[[], bool] | None = None
+) -> bool:
     import ray
 
     ray.init(address=f"{settings.head_ip}:{settings.ray_port}", logging_level="ERROR")
@@ -177,7 +175,9 @@ def wait_for_gpu_pool(settings: Settings) -> None:
             available = int(ray.cluster_resources().get("GPU", 0))
             if available >= settings.total_gpus:
                 print(f"Ray pool ready: {available} GPUs", flush=True)
-                return
+                return True
+            if competing_leader is not None and competing_leader():
+                return False
             if time.monotonic() >= deadline:
                 raise TimeoutError(
                     f"Ray found {available}/{settings.total_gpus} GPUs before timeout"
@@ -186,36 +186,3 @@ def wait_for_gpu_pool(settings: Settings) -> None:
             time.sleep(5)
     finally:
         ray.shutdown()
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="lanllm")
-    parser.add_argument("role", choices=("head", "worker"))
-    parser.add_argument("--dry-run", action="store_true")
-    args = parser.parse_args(argv)
-    role: Literal["head", "worker"] = args.role
-    try:
-        settings = Settings.from_environment(role, dict(os.environ))
-    except ValueError as exc:
-        parser.error(str(exc))
-
-    ray_args = ray_command(settings)
-    if args.dry_run:
-        print(shlex.join(ray_args))
-        if role == "head":
-            print(shlex.join(vllm_command(settings)))
-        return 0
-
-    env = runtime_environment(settings)
-    if role == "worker":
-        os.execvpe("ray", ray_args, env)
-    subprocess.run(ray_args, check=True, env=env)
-    wait_for_gpu_pool(settings)
-    server_args = vllm_command(settings)
-    print(shlex.join(server_args), flush=True)
-    os.execvpe("vllm", server_args, env)
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
