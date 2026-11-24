@@ -178,7 +178,7 @@ def run_dashboard(peers: list[str], port: int, api_port: int, interval: float) -
             height, width = screen.getmaxyx()
             lines = render_dashboard(states, offline, max(1, width - 1), api_port, history)
             screen.erase()
-            for row, line in enumerate(lines[: max(0, height - 1)]):
+            for row, line in enumerate(lines[:height]):
                 try:
                     style = 0
                     if curses.has_colors():

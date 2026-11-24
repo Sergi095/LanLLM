@@ -128,6 +128,15 @@ command works from any directory after installation.
 | `lanllm logs` | Follow the local container logs. |
 | `lanllm stop` | Stop the local container. |
 
+The live dashboard shows utilization and memory use for every reachable GPU:
+
+![LanLLM terminal dashboard showing three GPUs across two nodes](docs/images/dashboard.png)
+
+The model catalog shows which downloads fit on the leader and which require
+the GPU pool:
+
+![LanLLM model catalog with weight sizes, backends, and fit estimates](docs/images/models.png)
+
 `nvidia-smi` lists only the GPUs physically attached to its host. LanLLM's
 commands show the network pool. The node registry retains the last known
 capacity of offline workers.
@@ -157,6 +166,8 @@ lanllm fit owner/gguf-repository --backend llama.cpp
 lanllm fit owner/gguf-repository --backend llama.cpp --file model.Q8_K.gguf
 lanllm fit ollama:model:tag
 ```
+
+![LanLLM fit estimate for a model requiring the GPU pool](docs/images/fit.png)
 
 The recommendation favors headroom and may select a variant that fits the
 leader alone. To use the worker GPUs, inspect a larger variant with `--file`;
