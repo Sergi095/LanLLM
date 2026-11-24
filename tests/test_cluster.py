@@ -412,6 +412,7 @@ class StatusTests(unittest.TestCase):
             {
                 "node_ip": "192.168.2.33",
                 "role": "leader",
+                "serving": True,
                 "model_id": "Qwen/Qwen2.5-14B-Instruct",
                 "gpus": [
                     {
@@ -444,6 +445,9 @@ class StatusTests(unittest.TestCase):
         output = format_status([state], ["192.168.2.26"], 8001)
         self.assertIn("Model: none loaded", output)
         self.assertNotIn("Model: Qwen/Qwen2.5-14B-Instruct", output)
+        state["role"] = "leader"
+        output = format_status([state], ["192.168.2.26"], 8001)
+        self.assertIn("Model: none loaded (selected Qwen/Qwen2.5-14B-Instruct)", output)
 
     def test_unmounted_store_is_rejected(self) -> None:
         with TemporaryDirectory() as directory:

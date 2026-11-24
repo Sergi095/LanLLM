@@ -211,6 +211,7 @@ class State:
         self.instance_id = uuid.uuid4().hex
         self.role = "candidate"
         self.leader_ip = ""
+        self.serving = False
         self.lock = threading.Lock()
         self.system_sampler = SystemSampler(config.network_interface)
 
@@ -218,13 +219,18 @@ class State:
         with self.lock:
             self.role = role
             self.leader_ip = leader_ip
+            self.serving = False
         print(
             f"LanLLM: {role} on {self.config.node_ip}; leader {leader_ip}", flush=True
         )
 
+    def set_serving(self, serving: bool) -> None:
+        with self.lock:
+            self.serving = serving
+
     def identity(self) -> dict:
         with self.lock:
-            role, leader_ip = self.role, self.leader_ip
+            role, leader_ip, serving = self.role, self.leader_ip, self.serving
         local_store = Path("/models-local")
         has_model = (
             local_store / self.config.model_file
@@ -240,6 +246,7 @@ class State:
             "instance_id": self.instance_id,
             "role": role,
             "leader_ip": leader_ip,
+            "serving": serving,
             "store_priority": int(has_model or has_selection),
             "model_store_dir": self.config.store_dir,
         }
@@ -1037,6 +1044,16 @@ def reachable(ip: str, port: int) -> bool:
         return False
 
 
+def model_api_ready(port: int) -> bool:
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/v1/models", timeout=1
+        ) as response:
+            return bool(json.load(response).get("data"))
+    except (OSError, ValueError, urllib.error.URLError):
+        return False
+
+
 def llama_rpc_command(config: Config) -> list[str]:
     return [
         "ggml-rpc-server",
@@ -1234,6 +1251,7 @@ def run_leader(config: Config, state: State) -> None:
             print("Waiting for llama.cpp RPC workers", flush=True)
             time.sleep(3)
         server = subprocess.Popen(llama_server_command(config, endpoints))
+        serving = False
         try:
             while server.poll() is None:
                 if lower_priority_leader(config) is not None:
@@ -1245,9 +1263,13 @@ def run_leader(config: Config, state: State) -> None:
                 ):
                     print("GPU pool lost capacity; stopping model", flush=True)
                     return
+                if not serving and model_api_ready(config.api_port):
+                    state.set_serving(True)
+                    serving = True
                 time.sleep(5)
             raise RuntimeError(f"llama.cpp server exited with code {server.returncode}")
         finally:
+            state.set_serving(False)
             stop_process(server)
     ensure_model(config)
     settings = config.settings(
@@ -1288,6 +1310,7 @@ def run_leader(config: Config, state: State) -> None:
                 vllm_command(inference_settings),
                 env=runtime_environment(inference_settings),
             )
+            serving = False
             last_registry_update = 0.0
             while server.poll() is None:
                 other_leader = lower_priority_leader(config)
@@ -1303,9 +1326,14 @@ def run_leader(config: Config, state: State) -> None:
                         print("GPU pool lost capacity; stopping model", flush=True)
                         return
                     last_registry_update = time.monotonic()
+                if not serving and model_api_ready(internal_port):
+                    state.set_serving(True)
+                    serving = True
                 time.sleep(3)
+            state.set_serving(False)
             print(f"vLLM exited with code {server.returncode}; restarting", flush=True)
     finally:
+        state.set_serving(False)
         stop_process(server)
         stop_ray()
         public_proxy.shutdown()
@@ -1390,11 +1418,17 @@ def format_status(states: list[dict], offline: list[str], api_port: int) -> str:
     lines = ["LanLLM GPU pool", "=" * 109]
     if states:
         leaders = [state for state in states if state["role"] == "leader"]
-        if leaders:
+        if leaders and leaders[0].get("serving"):
             active = leaders[0]
             backend = active.get("backend", "vllm")
             lines.append(
                 f"Model: {active['model_id']} ({backend})   Leader: {active['node_ip']}"
+            )
+        elif leaders:
+            active = leaders[0]
+            lines.append(
+                f"Model: none loaded (selected {active['model_id']})   "
+                f"Leader: {active['node_ip']}"
             )
         else:
             lines.append("Model: none loaded   Leader: starting")
