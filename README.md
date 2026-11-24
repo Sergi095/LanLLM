@@ -41,13 +41,27 @@ for NFS on port 2049, the configured API and control ports, and Ray's worker
 ports. llama.cpp GPU RPC uses TCP port 50052 by default. The containers use
 host networking and privileged mode for the NFS mount.
 
-## Configure a node
+## Install
 
-Copy the example on **each** node and edit `lanllm.conf`:
+Run the installer on each node from a persistent checkout:
 
 ```bash
-cd /path/to/LanLLM
-cp lanllm.conf.example lanllm.conf
+git clone https://github.com/Sergi095/LanLLM.git
+cd LanLLM
+./install.sh
+```
+
+The installer checks Python, Docker Compose, and the NVIDIA driver; creates
+`lanllm.conf` and `.env` from their examples if missing; and links the `lanllm`
+command into `/usr/local/bin`. It preserves existing configuration and can be
+run again after an update. Keep the checkout in place while LanLLM is installed.
+
+## Configure a node
+
+Edit `lanllm.conf` on **each** node before starting the containers:
+
+```bash
+${EDITOR:-nano} lanllm.conf
 ```
 
 This example uses documentation addresses and a placeholder model ID. Replace
@@ -110,18 +124,15 @@ The `.env` file is available for optional secrets and settings not in the TOML
 file; `lanllm.conf` wins when both define the same setting. For gated Hugging
 Face repositories, provide `HF_TOKEN` on every node that might become leader.
 
-## Install and start
+## Start and use
 
-Install the host command once per node:
+Start the container on each configured node:
 
 ```bash
-cd /path/to/LanLLM
-sudo ln -s "$PWD/bin/lanllm" /usr/local/bin/lanllm
 lanllm start
 ```
 
-Run `lanllm start` on the other configured nodes when they are available. The
-command works from any directory after installation.
+The command works from any directory after installation.
 
 | Command | Result |
 | --- | --- |
@@ -242,36 +253,6 @@ that limit.
 ```bash
 curl http://<node-lan-ip>:8001/v1/models
 ```
-
-### Goose model discovery
-
-Use a custom OpenAI-compatible provider with dynamic models and no fixed
-`context_limit` entries:
-
-```json
-{
-  "name": "custom_lanllm",
-  "engine": "openai",
-  "display_name": "LanLLM",
-  "api_key_env": "",
-  "base_url": "http://192.0.2.10:8001",
-  "base_path": "/v1/chat/completions",
-  "models": [],
-  "dynamic_models": true,
-  "skip_canonical_filtering": true,
-  "supports_streaming": true,
-  "requires_auth": false
-}
-```
-
-Replace the documentation address with either node's LAN address. Goose can
-discover the active model and its `meta.n_ctx` from `/v1/models`. An explicit
-`models[].context_limit` or `GOOSE_CONTEXT_LIMIT` overrides discovery. Start a
-new Goose session after changing providers or switching models so cached model
-information is refreshed. Context discovery reports the server allocation; to
-increase it, change `inference.max_model_len` and restart LanLLM. The new size
-must still fit the GPUs. See [Goose's context resolution
-guidance](https://github.com/aaif-goose/goose/issues/10966).
 
 Only one service can bind the configured API port on a host. Change `api.port`
 on every node if another process already uses it.
