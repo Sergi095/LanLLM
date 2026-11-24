@@ -5,7 +5,8 @@ peers = ["192.168.2.33", "192.168.2.26"]
 total_gpus = 3
 
 [models]
-# Local folder exported by this node when it leads. No NAS is required.
+# LanLLM creates and exports its own folder. Kratos can override this with
+# /disks/sata1/lanllm; Katana can keep this default.
 directory = "/srv/lanllm-store"
 default_id = "Qwen/Qwen2.5-14B-Instruct"
 # revision = "main"
@@ -15,6 +16,7 @@ default_id = "Qwen/Qwen2.5-14B-Instruct"
 max_model_len = 2048
 gpu_memory_utilization = 0.9
 layer_partition = "auto"
+llama_rpc_port = 50052
 # quantization = "awq"
 # dtype = "auto"
 # trust_remote_code = false

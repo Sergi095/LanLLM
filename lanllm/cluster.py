@@ -20,6 +20,7 @@ import urllib.request
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from lanllm.model_sources import download_model, model_metadata, parse_source
 from lanllm.launch import (
     Settings,
     ray_command,
@@ -33,6 +34,8 @@ MODEL_ID_PATTERN = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)?\Z"
 )
 REGISTRY_LOCK = threading.Lock()
+DOWNLOAD_LOCK = threading.Lock()
+DOWNLOAD_JOB: dict = {"status": "idle"}
 
 
 def selected_model(root: Path = Path("/models")) -> str | None:
@@ -44,6 +47,24 @@ def selected_model(root: Path = Path("/models")) -> str | None:
     if not MODEL_ID_PATTERN.fullmatch(model_id) or ".." in model_id:
         raise ValueError(f"Invalid model ID in {selection}: {model_id!r}")
     return model_id
+
+
+def selected_spec(root: Path = Path("/models")) -> dict | None:
+    path = root / ".lanllm-selection.json"
+    if path.exists():
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("backend") not in {"vllm", "llama.cpp"}:
+            raise ValueError("Invalid selected backend")
+        relative = data.get("relative_path", "")
+        if (
+            not isinstance(relative, str)
+            or Path(relative).is_absolute()
+            or ".." in Path(relative).parts
+        ):
+            raise ValueError("Invalid selected model path")
+        return data
+    legacy = selected_model(root)
+    return model_metadata(parse_source(legacy), 0) if legacy else None
 
 
 def local_ip_for(peer_ip: str) -> str:
@@ -107,10 +128,16 @@ class Config:
     api_port: int
     control_port: int
     env: dict[str, str]
+    backend: str = "vllm"
+    model_file: str = ""
 
     @property
     def model_path(self) -> Path:
-        return Path("/models/models") / self.model_id
+        return (
+            Path("/models") / self.model_file
+            if self.model_file
+            else Path("/models/models") / self.model_id
+        )
 
     @classmethod
     def from_environment(cls, env: dict[str, str]) -> "Config":
@@ -194,9 +221,14 @@ class State:
             role, leader_ip = self.role, self.leader_ip
         local_store = Path("/models-local")
         has_model = (
-            local_store / "models" / self.config.model_id / ".lanllm-ready"
-        ).is_file()
-        has_selection = (local_store / ".lanllm-model").is_file()
+            local_store / self.config.model_file
+            if self.config.model_file
+            else local_store / "models" / self.config.model_id / ".lanllm-ready"
+        ).exists()
+        has_selection = any(
+            (local_store / name).is_file()
+            for name in (".lanllm-model", ".lanllm-selection.json")
+        )
         return {
             "node_ip": self.config.node_ip,
             "role": role,
@@ -209,6 +241,7 @@ class State:
         total_ram, available_ram = ram_gib()
         return self.identity() | {
             "model_id": self.config.model_id,
+            "backend": self.config.backend,
             "gpus": gpu_rows(),
             "cpus": os.cpu_count(),
             "ram_total_gib": round(total_ram, 1),
@@ -233,6 +266,9 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 else model_catalog(self.server.state.config, nodes)
             )
             payload = json.dumps(data).encode()
+        elif self.path == "/download":
+            with DOWNLOAD_LOCK:
+                payload = json.dumps(DOWNLOAD_JOB).encode()
         else:
             self.send_error(404)
             return
@@ -243,7 +279,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def do_POST(self) -> None:
-        if self.path != "/model":
+        if self.path not in {"/model", "/download"}:
             self.send_error(404)
             return
         if self.client_address[0] not in self.server.state.config.peer_ips:
@@ -251,6 +287,27 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
             return
         if self.server.state.identity()["role"] != "leader":
             self.send_error(409, "This node is not the leader")
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= 2048:
+                raise ValueError("Invalid request length")
+            data = json.loads(self.rfile.read(length))
+            if not isinstance(data, dict):
+                raise ValueError("Expected a JSON object")
+        except (ValueError, TypeError) as exc:
+            self.send_error(400, str(exc))
+            return
+        if self.path == "/download":
+            try:
+                spec = parse_source(
+                    data["source"], data.get("backend"), data.get("file", "")
+                )
+                start_download(spec, self.server.state)
+            except (ValueError, KeyError, TypeError) as exc:
+                self.send_error(409, str(exc))
+                return
+            self.reply_json({"status": "started", "ref": spec["ref"]})
             return
         config = self.server.state.config
         online_gpus = config.local_gpus
@@ -267,29 +324,46 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
             )
             return
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            if not 0 < length <= 512:
-                raise ValueError("Invalid model request length")
-            model_id = json.loads(self.rfile.read(length))["model_id"]
-            if (
-                not isinstance(model_id, str)
-                or not MODEL_ID_PATTERN.fullmatch(model_id)
-                or ".." in model_id
-            ):
-                raise ValueError("Invalid Hugging Face model ID")
+            model_id = data["model_id"]
+            if not isinstance(model_id, str):
+                raise ValueError("Invalid model reference")
+            if model_id.startswith(("ollama:", "hf:")):
+                catalog = model_catalog(
+                    config, registered_nodes(config, self.server.state)
+                )
+                matches = [
+                    item for item in catalog["models"] if item["model_id"] == model_id
+                ]
+                if len(matches) != 1:
+                    raise ValueError("Model is not available in the leader's library")
+                selection = {
+                    key: matches[0][key]
+                    for key in (
+                        "ref",
+                        "backend",
+                        "source",
+                        "relative_path",
+                        "weight_bytes",
+                    )
+                }
+            else:
+                selection = model_metadata(parse_source(model_id), 0)
         except (ValueError, KeyError, TypeError) as exc:
             self.send_error(400, str(exc))
             return
-        temporary = Path("/models") / (
-            f".lanllm-model.{os.getpid()}.{threading.get_ident()}"
+        temporary = (
+            Path("/models") / f".lanllm-selection.{os.getpid()}.{threading.get_ident()}"
         )
         try:
-            temporary.write_text(model_id + "\n", encoding="utf-8")
-            temporary.replace(Path("/models/.lanllm-model"))
+            temporary.write_text(json.dumps(selection) + "\n", encoding="utf-8")
+            temporary.replace(Path("/models/.lanllm-selection.json"))
         except OSError as exc:
             self.send_error(503, str(exc))
             return
-        payload = json.dumps({"model_id": model_id}).encode()
+        self.reply_json({"model_id": model_id})
+
+    def reply_json(self, data: dict) -> None:
+        payload = json.dumps(data).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
@@ -462,7 +536,9 @@ def estimate_fit(weight_bytes: int, leader_mib: int, pool_mib: int) -> str:
     return "too_large"
 
 
-def model_catalog(config: Config, nodes: list[dict]) -> dict:
+def model_catalog(
+    config: Config, nodes: list[dict], library_root: Path = Path("/models")
+) -> dict:
     def budget(selected: list[dict]) -> int:
         return sum(
             max(
@@ -479,7 +555,7 @@ def model_catalog(config: Config, nodes: list[dict]) -> dict:
     pool_mib = budget(nodes)
     online_mib = budget([node for node in nodes if node["online"]])
     models = []
-    root = Path("/models/models")
+    root = library_root / "models"
     if root.is_dir():
         candidates = [
             candidate
@@ -492,18 +568,48 @@ def model_catalog(config: Config, nodes: list[dict]) -> dict:
             weights = [
                 file
                 for file in directory.rglob("*")
-                if file.is_file() and file.suffix in {".safetensors", ".bin", ".gguf"}
+                if file.is_file() and file.suffix in {".safetensors", ".bin", ".pt"}
             ]
             weight_bytes = sum(file.stat().st_size for file in weights)
             weight_mib = (weight_bytes + 1048575) // 1048576
             models.append(
                 {
                     "model_id": directory.relative_to(root).as_posix(),
+                    "ref": directory.relative_to(root).as_posix(),
+                    "backend": "vllm",
+                    "source": "hf",
+                    "relative_path": f"models/{directory.relative_to(root).as_posix()}",
                     "weight_bytes": weight_bytes,
                     "fit": estimate_fit(weight_bytes, leader_mib, pool_mib),
                     "fits_online_vram": bool(weights) and weight_mib <= online_mib,
                 }
             )
+    gguf_root = library_root / "gguf"
+    if gguf_root.is_dir():
+        for marker in sorted(gguf_root.rglob("*.gguf.lanllm-ready")):
+            try:
+                metadata = json.loads(marker.read_text(encoding="utf-8"))
+                relative = metadata["relative_path"]
+                file = library_root / relative
+                if (
+                    metadata["backend"] != "llama.cpp"
+                    or not file.is_file()
+                    or not file.resolve().is_relative_to(gguf_root.resolve())
+                ):
+                    continue
+                weight_bytes = file.stat().st_size
+                weight_mib = (weight_bytes + 1048575) // 1048576
+                models.append(
+                    {
+                        "model_id": metadata["ref"],
+                        **metadata,
+                        "weight_bytes": weight_bytes,
+                        "fit": estimate_fit(weight_bytes, leader_mib, pool_mib),
+                        "fits_online_vram": weight_mib <= online_mib,
+                    }
+                )
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
     return {
         "models": models,
         "leader_usable_mib": leader_mib,
@@ -512,6 +618,56 @@ def model_catalog(config: Config, nodes: list[dict]) -> dict:
         "registered_nodes": sum(bool(node["gpus"]) for node in nodes),
         "online_nodes": sum(node["online"] for node in nodes),
     }
+
+
+def start_download(spec: dict, state: State) -> None:
+    global DOWNLOAD_JOB
+    with DOWNLOAD_LOCK:
+        if DOWNLOAD_JOB.get("status") in {"checking", "downloading"}:
+            raise ValueError("Another model download is already running")
+        DOWNLOAD_JOB = {
+            "status": "checking",
+            "stage": "Checking model metadata",
+            "ref": spec["ref"],
+            "downloaded_bytes": 0,
+            "total_bytes": 0,
+        }
+
+    def report(stage: str, current: int, total: int) -> None:
+        with DOWNLOAD_LOCK:
+            DOWNLOAD_JOB.update(
+                stage=stage,
+                status="downloading" if stage == "Downloading" else "checking",
+                ref=spec["ref"],
+                downloaded_bytes=current,
+                total_bytes=total,
+            )
+
+    def work() -> None:
+        global DOWNLOAD_JOB
+        try:
+            config = state.config
+            spec["revision"] = (
+                config.env.get("HF_REVISION") or "main"
+                if spec["source"] == "hf"
+                else "main"
+            )
+            nodes = registered_nodes(config, state)
+            online_mib = model_catalog(config, nodes)["online_usable_mib"]
+            metadata = download_model(
+                spec,
+                Path("/models"),
+                config.env.get("HF_TOKEN") or None,
+                online_mib * 1048576,
+                report,
+            )
+            with DOWNLOAD_LOCK:
+                DOWNLOAD_JOB.update(status="ready", stage="Ready", ref=metadata["ref"])
+        except Exception as exc:
+            with DOWNLOAD_LOCK:
+                DOWNLOAD_JOB.update(status="error", stage="Failed", error=str(exc))
+
+    threading.Thread(target=work, daemon=True).start()
 
 
 def mount_model_store(config: Config, leader_ip: str) -> None:
@@ -551,12 +707,20 @@ def unmount_model_store() -> None:
 
 
 def model_ready(config: Config) -> bool:
+    if config.backend == "llama.cpp":
+        return (
+            config.model_path.is_file()
+            and config.model_path.with_name(
+                config.model_path.name + ".lanllm-ready"
+            ).is_file()
+        )
     revision = config.env.get("HF_REVISION", "").strip() or "main"
     try:
-        return (config.model_path / "config.json").is_file() and (
-            config.model_path / ".lanllm-ready"
-        ).read_text().strip() == revision
-    except OSError:
+        marker = (config.model_path / ".lanllm-ready").read_text().strip()
+        if marker.startswith("{"):
+            marker = json.loads(marker).get("revision", "main")
+        return (config.model_path / "config.json").is_file() and (marker == revision)
+    except (OSError, ValueError):
         return False
 
 
@@ -668,11 +832,47 @@ def reachable(ip: str, port: int) -> bool:
         return False
 
 
+def llama_rpc_command(config: Config) -> list[str]:
+    return [
+        "ggml-rpc-server",
+        "--host",
+        config.node_ip,
+        "--port",
+        config.env.get("LLAMA_RPC_PORT", "50052"),
+    ]
+
+
+def llama_server_command(config: Config, endpoints: list[str]) -> list[str]:
+    return [
+        "llama-server",
+        "--model",
+        str(config.model_path),
+        "--host",
+        "0.0.0.0",
+        "--port",
+        str(config.api_port),
+        "--alias",
+        config.model_id,
+        "--ctx-size",
+        config.env.get("MAX_MODEL_LEN", "2048"),
+        "--n-gpu-layers",
+        "all",
+        "--rpc",
+        ",".join(endpoints),
+    ]
+
+
 def lower_priority_leader(config: Config) -> str | None:
     local_store = Path("/models-local")
+    local_model = (
+        (local_store / config.model_file).exists()
+        if config.model_file
+        else (local_store / "models" / config.model_id / ".lanllm-ready").is_file()
+    )
     local_priority = int(
         (local_store / ".lanllm-model").is_file()
-        or (local_store / "models" / config.model_id / ".lanllm-ready").is_file()
+        or (local_store / ".lanllm-selection.json").is_file()
+        or local_model
     )
     for ip in config.peer_ips:
         if ip == config.node_ip:
@@ -703,6 +903,20 @@ def run_worker(config: Config, state: State, leader_ip: str) -> None:
     try:
         if not wait_for_model(config, leader_ip):
             return
+        if config.backend == "llama.cpp":
+            process = subprocess.Popen(llama_rpc_command(config))
+            while process.poll() is None:
+                leader = query_node(leader_ip, config.control_port)
+                if leader is None or leader.get("role") != "leader":
+                    failures += 1
+                    if failures >= 3:
+                        return
+                else:
+                    failures = 0
+                time.sleep(2)
+            raise RuntimeError(
+                f"llama.cpp RPC server exited with code {process.returncode}"
+            )
         settings = config.settings(
             "worker", leader_ip, resolve_partition(config, leader_ip)
         )
@@ -757,6 +971,28 @@ def run_leader(config: Config, state: State) -> None:
         )
         time.sleep(5)
     registered_nodes(config, state)
+    if config.backend == "llama.cpp":
+        if not model_ready(config):
+            raise RuntimeError(f"Download {config.model_id} before selecting it")
+        rpc_port = int(config.env.get("LLAMA_RPC_PORT", "50052"))
+        endpoints = [
+            f"{ip}:{rpc_port}" for ip in config.peer_ips if ip != config.node_ip
+        ]
+        while not all(
+            reachable(ip, rpc_port) for ip in config.peer_ips if ip != config.node_ip
+        ):
+            print("Waiting for llama.cpp RPC workers", flush=True)
+            time.sleep(3)
+        server = subprocess.Popen(llama_server_command(config, endpoints))
+        try:
+            while server.poll() is None:
+                if lower_priority_leader(config) is not None:
+                    return
+                registered_nodes(config, state)
+                time.sleep(5)
+            raise RuntimeError(f"llama.cpp server exited with code {server.returncode}")
+        finally:
+            stop_process(server)
     ensure_model(config)
     settings = config.settings(
         "head", config.node_ip, resolve_partition(config, config.node_ip)
@@ -810,7 +1046,11 @@ def run(config: Config) -> None:
             if not Path("/models").is_mount():
                 continue
             try:
-                changed = selected_model() not in (None, state.config.model_id)
+                selection = selected_spec()
+                changed = selection is not None and (
+                    selection["ref"] != state.config.model_id
+                    or selection["backend"] != state.config.backend
+                )
             except (OSError, ValueError) as exc:
                 print(f"Model selection error: {exc}", flush=True)
                 continue
@@ -842,7 +1082,13 @@ def run(config: Config) -> None:
             )
             try:
                 mount_model_store(config, leader_ip)
-                active = replace(config, model_id=selected_model() or config.model_id)
+                selection = selected_spec()
+                active = replace(
+                    config,
+                    model_id=selection["ref"] if selection else config.model_id,
+                    backend=selection["backend"] if selection else "vllm",
+                    model_file=selection["relative_path"] if selection else "",
+                )
                 state.config = active
                 if leader_ip == config.node_ip:
                     run_leader(active, state)
@@ -865,7 +1111,8 @@ def format_status(states: list[dict], offline: list[str], api_port: int) -> str:
     if states:
         leaders = [state["node_ip"] for state in states if state["role"] == "leader"]
         leader = leaders[0] if leaders else "starting"
-        lines.append(f"Model: {states[0]['model_id']}   Leader: {leader}")
+        backend = states[0].get("backend", "vllm")
+        lines.append(f"Model: {states[0]['model_id']} ({backend})   Leader: {leader}")
     lines.append(
         f"{'Node / role':<25} {'GPU':<3} {'Name':<36} {'Temp':>5} "
         f"{'Util':>5} {'VRAM used / total':>21} {'Power':>8}"

@@ -1,3 +1,4 @@
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -9,9 +10,13 @@ from lanllm.cluster import (
     elect_leader,
     estimate_fit,
     format_status,
+    llama_rpc_command,
+    llama_server_command,
+    model_catalog,
     mount_model_store,
     registered_nodes,
     selected_model,
+    selected_spec,
     verify_model_store,
 )
 
@@ -77,6 +82,62 @@ class ElectionTests(unittest.TestCase):
 
 
 class StatusTests(unittest.TestCase):
+    def test_catalog_lists_downloaded_gguf_model(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            file = root / "gguf/ollama/library/qwen2.5/0.5b/model.gguf"
+            file.parent.mkdir(parents=True)
+            file.write_bytes(b"x" * 100)
+            (file.parent / "model.gguf.lanllm-ready").write_text(
+                json.dumps(
+                    {
+                        "ref": "ollama:qwen2.5:0.5b",
+                        "backend": "llama.cpp",
+                        "source": "ollama",
+                        "relative_path": "gguf/ollama/library/qwen2.5/0.5b/model.gguf",
+                    }
+                )
+            )
+            config = SimpleNamespace(
+                node_ip="192.168.2.33", env={"GPU_MEMORY_UTILIZATION": "0.9"}
+            )
+            nodes = [
+                {
+                    "node_ip": "192.168.2.33",
+                    "online": True,
+                    "gpus": [{"total_mib": "16303"}],
+                }
+            ]
+            catalog = model_catalog(config, nodes, root)
+        self.assertEqual(catalog["models"][0]["model_id"], "ollama:qwen2.5:0.5b")
+        self.assertEqual(catalog["models"][0]["backend"], "llama.cpp")
+
+    def test_llama_commands_use_remote_gpu_and_same_api_port(self) -> None:
+        config = SimpleNamespace(
+            node_ip="192.168.2.26",
+            model_path=Path("/models/gguf/ollama/library/qwen2.5/0.5b/model.gguf"),
+            model_id="ollama:qwen2.5:0.5b",
+            api_port=8001,
+            env={"LLAMA_RPC_PORT": "50052", "MAX_MODEL_LEN": "2048"},
+        )
+        self.assertEqual(llama_rpc_command(config)[-2:], ["--port", "50052"])
+        command = llama_server_command(config, ["192.168.2.26:50052"])
+        self.assertIn("192.168.2.26:50052", command)
+        self.assertEqual(command[command.index("--port") + 1], "8001")
+        self.assertEqual(command[command.index("--alias") + 1], config.model_id)
+
+    def test_json_selection_supersedes_legacy_model(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".lanllm-model").write_text("Qwen/Qwen2.5-14B-Instruct\n")
+            selection = {
+                "ref": "ollama:qwen2.5:0.5b",
+                "backend": "llama.cpp",
+                "relative_path": "gguf/ollama/library/qwen2.5/0.5b/model.gguf",
+            }
+            (root / ".lanllm-selection.json").write_text(json.dumps(selection))
+            self.assertEqual(selected_spec(root), selection)
+
     def test_registry_keeps_last_known_worker_capacity_when_offline(self) -> None:
         config = SimpleNamespace(
             node_ip="192.168.2.33",

@@ -8,8 +8,10 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import tomllib
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
@@ -23,8 +25,10 @@ from lanllm.cluster import (  # noqa: E402
     local_ip_for,
     query_node,
     selected_model,
+    selected_spec,
     verify_model_store,
 )
+from lanllm.model_sources import parse_source  # noqa: E402
 
 
 def configuration() -> dict[str, str]:
@@ -64,6 +68,7 @@ def configuration() -> dict[str, str]:
             (inference, "quantization", "QUANTIZATION"),
             (inference, "dtype", "DTYPE"),
             (inference, "trust_remote_code", "TRUST_REMOTE_CODE"),
+            (inference, "llama_rpc_port", "LLAMA_RPC_PORT"),
             (api, "port", "API_PORT"),
             (api, "control_port", "CONTROL_PORT"),
         )
@@ -113,13 +118,64 @@ def status() -> int:
 
 
 def leader_endpoint(values: dict[str, str], endpoint: str) -> dict:
+    with urlopen(leader_url(values, endpoint), timeout=10) as response:
+        return json.load(response)
+
+
+def leader_url(values: dict[str, str], endpoint: str) -> str:
     port = int(values.get("CONTROL_PORT", "8501"))
     states = [query_node(ip, port, timeout=2) for ip in peer_ips(values)]
     leaders = [state for state in states if state and state["role"] == "leader"]
     if not leaders:
         raise ValueError("No LanLLM leader is online")
-    with urlopen(f"http://{leaders[0]['node_ip']}:{port}/{endpoint}", timeout=10) as response:
-        return json.load(response)
+    return f"http://{leaders[0]['node_ip']}:{port}/{endpoint}"
+
+
+def post_leader(values: dict[str, str], endpoint: str, data: dict) -> dict:
+    request = Request(
+        leader_url(values, endpoint),
+        data=json.dumps(data).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=15) as response:
+            return json.load(response)
+    except HTTPError as exc:
+        raise ValueError(
+            f"Leader rejected request: HTTP {exc.code} {exc.reason}"
+        ) from exc
+
+
+def download(source: str | None, backend: str | None, filename: str) -> int:
+    values = configuration()
+    if source:
+        spec = parse_source(source, backend, filename)
+        post_leader(
+            values, "download", {"source": source, "backend": backend, "file": filename}
+        )
+        print(f"Downloading {spec['ref']} on the leader")
+    elif backend or filename:
+        raise ValueError("A model source is required with --backend or --file")
+    previous = ""
+    while True:
+        with urlopen(leader_url(values, "download"), timeout=10) as response:
+            job = json.load(response)
+        total, current = job.get("total_bytes", 0), job.get("downloaded_bytes", 0)
+        progress = f" {current / 2**30:.2f}/{total / 2**30:.2f} GiB" if total else ""
+        line = f"{job.get('stage', job['status'])}{progress}"
+        if line != previous:
+            print(line, flush=True)
+            previous = line
+        if job["status"] == "ready":
+            print(f"Ready: {job['ref']}. Serve it with: lanllm model {job['ref']}")
+            return 0
+        if job["status"] == "error":
+            raise ValueError(job.get("error", "Download failed"))
+        if job["status"] == "idle":
+            print("No model download is running")
+            return 0
+        time.sleep(2)
 
 
 def nodes() -> int:
@@ -158,7 +214,7 @@ def models() -> int:
         f"registered pool {pool_gib:.1f} GiB "
         f"({data['online_nodes']}/{data['registered_nodes']} nodes online)"
     )
-    print(f"{'Model':<42} {'Weights':>10}  Fit")
+    print(f"{'Model':<42} {'Backend':<10} {'Weights':>10}  Fit")
     for entry in data["models"]:
         fit = {
             "leader": "leader alone",
@@ -169,7 +225,10 @@ def models() -> int:
         if entry["fit"] == "pool" and not entry["fits_online_vram"]:
             fit += " (worker offline)"
         gib = entry["weight_bytes"] / (1024**3)
-        print(f"{entry['model_id']:<42} {gib:>8.1f} GiB  {fit}")
+        print(
+            f"{entry['model_id']:<42} {entry.get('backend', 'vllm'):<10} "
+            f"{gib:>8.1f} GiB  {fit}"
+        )
     if not data["models"]:
         print("No downloaded models in the leader store")
     print("Estimate reserves 2 GiB per GPU for runtime and KV cache.")
@@ -220,11 +279,7 @@ def setup_store() -> None:
             "/var/lib/lanllm/owned-nfs-server",
             input_text="installed-by-lanllm\n",
         )
-    if (
-        store.exists()
-        and not (store / ".lanllm-store").exists()
-        and any(store.iterdir())
-    ):
+    if store.exists() and not (store / ".lanllm-store").exists() and any(store.iterdir()):
         raise ValueError(f"Model directory is not empty: {store}")
     sudo("install", "-d", "-m", "0755", str(store))
     marker = store / ".lanllm-store"
@@ -282,8 +337,10 @@ def uninstall(*, keep_source: bool, dry_run: bool) -> int:
         allowed = {
             ".lanllm-store",
             ".lanllm-model",
+            ".lanllm-selection.json",
             ".lanllm-nodes.json",
             "models",
+            "gguf",
             ".hf-cache",
         }
         unknown = [
@@ -291,6 +348,7 @@ def uninstall(*, keep_source: bool, dry_run: bool) -> int:
             for entry in store.iterdir()
             if entry.name not in allowed
             and not entry.name.startswith(".lanllm-model.")
+            and not entry.name.startswith(".lanllm-selection.")
             and not entry.name.startswith(".lanllm-nodes.")
         ]
         if unknown:
@@ -378,15 +436,20 @@ def model(model_id: str | None) -> int:
     leader = leaders[0] if leaders else None
     if model_id is None:
         current = leader["model_id"] if leader else None
-        print(current or selected_model(store) or values.get("MODEL_ID", ""))
+        selection = selected_spec(store)
+        print(current or (selection and selection["ref"]) or values.get("MODEL_ID", ""))
         return 0
     if model_id.startswith("https://"):
-        url = urlparse(model_id)
-        if url.netloc != "huggingface.co" or url.query or url.fragment:
-            raise ValueError("model URL must point to a Hugging Face repository")
-        model_id = url.path.strip("/")
-    if not MODEL_ID_PATTERN.fullmatch(model_id) or ".." in model_id:
-        raise ValueError("model must be a Hugging Face repository ID")
+        model_id = parse_source(model_id)["ref"]
+    if model_id.startswith("hf:") and "@" in model_id:
+        repo, filename = model_id.removeprefix("hf:").rsplit("@", 1)
+        parse_source("hf:" + repo, "llama.cpp", filename)
+    elif model_id.startswith("ollama:"):
+        model_id = parse_source(model_id)["ref"]
+    elif not MODEL_ID_PATTERN.fullmatch(model_id) or ".." in model_id:
+        raise ValueError(
+            "model must be a downloaded model reference or Hugging Face ID"
+        )
     if leader is None:
         raise ValueError("Start the GPU pool before selecting a model")
     online_gpus = sum(len(state["gpus"]) for state in states if state)
@@ -396,14 +459,7 @@ def model(model_id: str | None) -> int:
             f"Only {online_gpus}/{required_gpus} GPUs are online; "
             "start the missing worker before selecting a model"
         )
-    request = Request(
-        f"http://{leader['node_ip']}:{values.get('CONTROL_PORT', '8501')}/model",
-        data=json.dumps({"model_id": model_id}).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urlopen(request, timeout=15):
-        pass
+    post_leader(values, "model", {"model_id": model_id})
     print(f"Selected {model_id} on leader {leader['node_ip']}")
     return 0
 
@@ -414,9 +470,23 @@ def main() -> int:
         "action",
         nargs="?",
         default="status",
-        choices=("status", "nodes", "models", "start", "stop", "logs", "model", "uninstall"),
+        choices=(
+            "status",
+            "nodes",
+            "models",
+            "download",
+            "start",
+            "stop",
+            "logs",
+            "model",
+            "uninstall",
+        ),
     )
     parser.add_argument("model_id", nargs="?")
+    parser.add_argument("--backend", choices=("vllm", "llama.cpp"))
+    parser.add_argument(
+        "--file", default="", help="GGUF filename in a Hugging Face repository"
+    )
     parser.add_argument(
         "--keep-source", action="store_true", help="Keep the repository on uninstall"
     )
@@ -426,6 +496,10 @@ def main() -> int:
     args = parser.parse_args()
     if args.action == "uninstall":
         return uninstall(keep_source=args.keep_source, dry_run=args.dry_run)
+    if args.action == "download":
+        return download(args.model_id, args.backend, args.file)
+    if args.backend or args.file:
+        parser.error("--backend and --file are only accepted with 'download'")
     if args.keep_source:
         parser.error("--keep-source is only accepted with 'uninstall'")
     if args.dry_run:
