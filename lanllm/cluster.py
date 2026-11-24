@@ -17,7 +17,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from lanllm.launch import (
@@ -32,6 +32,7 @@ from lanllm.launch import (
 MODEL_ID_PATTERN = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)?\Z"
 )
+REGISTRY_LOCK = threading.Lock()
 
 
 def selected_model(root: Path = Path("/models")) -> str | None:
@@ -101,6 +102,7 @@ class Config:
     local_gpus: int
     total_gpus: int
     model_id: str
+    store_dir: str
     ray_port: int
     api_port: int
     control_port: int
@@ -132,11 +134,14 @@ class Config:
         total_gpus = int(env.get("TOTAL_GPUS", "3"))
         if total_gpus < local_gpus:
             raise ValueError("TOTAL_GPUS is less than this node's GPU count")
-        model_id = selected_model() or env.get("MODEL_ID", "").strip()
+        model_id = env.get("MODEL_ID", "").strip()
         if not model_id:
             raise ValueError("MODEL_ID must be set")
         if not MODEL_ID_PATTERN.fullmatch(model_id) or ".." in model_id:
             raise ValueError("MODEL_ID must be a Hugging Face model ID")
+        store_dir = env.get("MODEL_STORE_DIR", "/srv/lanllm-store").strip()
+        if not Path(store_dir).is_absolute():
+            raise ValueError("MODEL_STORE_DIR must be an absolute path")
         return cls(
             node_ip=node_ip,
             peer_ips=peers,
@@ -144,8 +149,9 @@ class Config:
             local_gpus=local_gpus,
             total_gpus=total_gpus,
             model_id=model_id,
+            store_dir=store_dir,
             ray_port=int(env.get("RAY_PORT", "6379")),
-            api_port=int(env.get("API_PORT", "8000")),
+            api_port=int(env.get("API_PORT", "8001")),
             control_port=int(env.get("CONTROL_PORT", "8501")),
             env=env,
         )
@@ -186,10 +192,17 @@ class State:
     def identity(self) -> dict:
         with self.lock:
             role, leader_ip = self.role, self.leader_ip
+        local_store = Path("/models-local")
+        has_model = (
+            local_store / "models" / self.config.model_id / ".lanllm-ready"
+        ).is_file()
+        has_selection = (local_store / ".lanllm-model").is_file()
         return {
             "node_ip": self.config.node_ip,
             "role": role,
             "leader_ip": leader_ip,
+            "store_priority": int(has_model or has_selection),
+            "model_store_dir": self.config.store_dir,
         }
 
     def snapshot(self) -> dict:
@@ -209,9 +222,74 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
             payload = json.dumps(self.server.state.identity()).encode()
         elif self.path == "/state":
             payload = json.dumps(self.server.state.snapshot()).encode()
+        elif self.path in {"/nodes", "/models"}:
+            if self.server.state.identity()["role"] != "leader":
+                self.send_error(409, "Query the elected leader")
+                return
+            nodes = registered_nodes(self.server.state.config, self.server.state)
+            data = (
+                {"nodes": nodes}
+                if self.path == "/nodes"
+                else model_catalog(self.server.state.config, nodes)
+            )
+            payload = json.dumps(data).encode()
         else:
             self.send_error(404)
             return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_POST(self) -> None:
+        if self.path != "/model":
+            self.send_error(404)
+            return
+        if self.client_address[0] not in self.server.state.config.peer_ips:
+            self.send_error(403)
+            return
+        if self.server.state.identity()["role"] != "leader":
+            self.send_error(409, "This node is not the leader")
+            return
+        config = self.server.state.config
+        online_gpus = config.local_gpus
+        for ip in config.peer_ips:
+            if ip == config.node_ip:
+                continue
+            peer = query_node(ip, config.control_port, full=True)
+            if peer is not None:
+                online_gpus += len(peer["gpus"])
+        if online_gpus < config.total_gpus:
+            self.send_error(
+                409,
+                f"Only {online_gpus}/{config.total_gpus} GPUs are online",
+            )
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= 512:
+                raise ValueError("Invalid model request length")
+            model_id = json.loads(self.rfile.read(length))["model_id"]
+            if (
+                not isinstance(model_id, str)
+                or not MODEL_ID_PATTERN.fullmatch(model_id)
+                or ".." in model_id
+            ):
+                raise ValueError("Invalid Hugging Face model ID")
+        except (ValueError, KeyError, TypeError) as exc:
+            self.send_error(400, str(exc))
+            return
+        temporary = Path("/models") / (
+            f".lanllm-model.{os.getpid()}.{threading.get_ident()}"
+        )
+        try:
+            temporary.write_text(model_id + "\n", encoding="utf-8")
+            temporary.replace(Path("/models/.lanllm-model"))
+        except OSError as exc:
+            self.send_error(503, str(exc))
+            return
+        payload = json.dumps({"model_id": model_id}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
@@ -250,12 +328,18 @@ def ip_key(ip: str) -> tuple[int, ...]:
     return tuple(int(part) for part in ip.split("."))
 
 
-def elect_leader(node_ip: str, peer_states: list[dict]) -> str:
-    leaders = [state["node_ip"] for state in peer_states if state["role"] == "leader"]
-    if leaders:
-        return min(leaders, key=ip_key)
-    candidates = [node_ip] + [state["node_ip"] for state in peer_states]
-    return min(candidates, key=ip_key)
+def elect_leader(node_ip: str, peer_states: list[dict], local_priority: int = 0) -> str:
+    candidates = peer_states + [
+        {"node_ip": node_ip, "role": "candidate", "store_priority": local_priority}
+    ]
+    return min(
+        candidates,
+        key=lambda state: (
+            -state.get("store_priority", 0),
+            state.get("role") != "leader",
+            ip_key(state["node_ip"]),
+        ),
+    )["node_ip"]
 
 
 def allocate_layers(layer_count: int, memory_mib: list[int]) -> list[int]:
@@ -310,9 +394,160 @@ def verify_model_store(root: Path = Path("/models")) -> None:
         valid = False
     if not valid:
         raise ValueError(
-            f"The shared NAS model store is not mounted at {root}; "
-            "check the Storage1 mount on this host"
+            f"The LanLLM model store is unavailable at {root}; "
+            "check the local folder or leader NFS mount"
         )
+
+
+def registered_nodes(
+    config: Config, state: State, root: Path = Path("/models")
+) -> list[dict]:
+    path = root / ".lanllm-nodes.json"
+    with REGISTRY_LOCK:
+        try:
+            saved = json.loads(path.read_text(encoding="utf-8"))["nodes"]
+            if not isinstance(saved, dict):
+                saved = {}
+        except (OSError, ValueError, KeyError, TypeError):
+            saved = {}
+        updated = dict(saved)
+        online = {config.node_ip: state.snapshot()}
+        for ip in config.peer_ips:
+            if ip == config.node_ip:
+                continue
+            peer = query_node(ip, config.control_port, timeout=2, full=True)
+            if peer is not None:
+                online[ip] = peer
+        for ip, snapshot in online.items():
+            updated[ip] = {
+                "gpus": [
+                    {
+                        "index": gpu["index"],
+                        "name": gpu["name"],
+                        "total_mib": gpu["total_mib"],
+                    }
+                    for gpu in snapshot["gpus"]
+                ],
+                "cpus": snapshot["cpus"],
+                "ram_total_gib": snapshot["ram_total_gib"],
+            }
+        if updated != saved:
+            temporary = path.with_name(
+                f".lanllm-nodes.{os.getpid()}.{threading.get_ident()}"
+            )
+            temporary.write_text(
+                json.dumps({"version": 1, "nodes": updated}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            temporary.replace(path)
+        return [
+            {
+                "node_ip": ip,
+                "online": ip in online,
+                "role": online[ip]["role"] if ip in online else "offline",
+                **updated.get(ip, {"gpus": [], "cpus": None, "ram_total_gib": None}),
+            }
+            for ip in config.peer_ips
+        ]
+
+
+def estimate_fit(weight_bytes: int, leader_mib: int, pool_mib: int) -> str:
+    if weight_bytes <= 0:
+        return "unknown"
+    weight_mib = (weight_bytes + 1048575) // 1048576
+    if weight_mib <= leader_mib:
+        return "leader"
+    if weight_mib <= pool_mib:
+        return "pool"
+    return "too_large"
+
+
+def model_catalog(config: Config, nodes: list[dict]) -> dict:
+    def budget(selected: list[dict]) -> int:
+        return sum(
+            max(
+                int(int(gpu["total_mib"]) * utilization) - 2048,
+                0,
+            )
+            for node in selected
+            for gpu in node["gpus"]
+        )
+
+    utilization = float(config.env.get("GPU_MEMORY_UTILIZATION", "0.7"))
+    leader = [node for node in nodes if node["node_ip"] == config.node_ip]
+    leader_mib = budget(leader)
+    pool_mib = budget(nodes)
+    online_mib = budget([node for node in nodes if node["online"]])
+    models = []
+    root = Path("/models/models")
+    if root.is_dir():
+        candidates = [
+            candidate
+            for owner in root.iterdir()
+            if owner.is_dir()
+            for candidate in [owner, *owner.iterdir()]
+            if candidate.is_dir() and (candidate / ".lanllm-ready").is_file()
+        ]
+        for directory in sorted(candidates):
+            weights = [
+                file
+                for file in directory.rglob("*")
+                if file.is_file() and file.suffix in {".safetensors", ".bin", ".gguf"}
+            ]
+            weight_bytes = sum(file.stat().st_size for file in weights)
+            weight_mib = (weight_bytes + 1048575) // 1048576
+            models.append(
+                {
+                    "model_id": directory.relative_to(root).as_posix(),
+                    "weight_bytes": weight_bytes,
+                    "fit": estimate_fit(weight_bytes, leader_mib, pool_mib),
+                    "fits_online_vram": bool(weights) and weight_mib <= online_mib,
+                }
+            )
+    return {
+        "models": models,
+        "leader_usable_mib": leader_mib,
+        "registered_usable_mib": pool_mib,
+        "online_usable_mib": online_mib,
+        "registered_nodes": sum(bool(node["gpus"]) for node in nodes),
+        "online_nodes": sum(node["online"] for node in nodes),
+    }
+
+
+def mount_model_store(config: Config, leader_ip: str) -> None:
+    target = Path("/models")
+    if target.is_mount():
+        raise RuntimeError(f"Model store is already mounted at {target}")
+    if leader_ip == config.node_ip:
+        command = ["mount", "--bind", "/models-local", str(target)]
+    else:
+        leader = query_node(leader_ip, config.control_port)
+        if leader is None or leader.get("role") != "leader":
+            raise RuntimeError(f"Leader {leader_ip} is not ready to export models")
+        export_dir = leader.get("model_store_dir", "")
+        if not Path(export_dir).is_absolute():
+            raise RuntimeError(f"Leader {leader_ip} advertised an invalid model path")
+        command = [
+            "mount",
+            "-t",
+            "nfs4",
+            "-o",
+            "ro,vers=4.2,soft,timeo=50,retrans=2",
+            f"{leader_ip}:{export_dir}",
+            str(target),
+        ]
+    subprocess.run(command, check=True, timeout=45)
+    try:
+        verify_model_store(target)
+    except Exception:
+        unmount_model_store()
+        raise
+    print(f"Model store mounted from {leader_ip} at {target}", flush=True)
+
+
+def unmount_model_store() -> None:
+    if Path("/models").is_mount():
+        subprocess.run(["umount", "-l", "/models"], check=False, timeout=15)
 
 
 def model_ready(config: Config) -> bool:
@@ -327,12 +562,12 @@ def model_ready(config: Config) -> bool:
 
 def ensure_model(config: Config) -> None:
     if model_ready(config):
-        print(f"Using shared NAS model at {config.model_path}", flush=True)
+        print(f"Using leader model store at {config.model_path}", flush=True)
         return
     from huggingface_hub import snapshot_download
 
     config.model_path.mkdir(parents=True, exist_ok=True)
-    print(f"Downloading {config.model_id} once to {config.model_path}", flush=True)
+    print(f"Downloading {config.model_id} into {config.model_path}", flush=True)
     snapshot_download(
         repo_id=config.model_id,
         local_dir=config.model_path,
@@ -340,12 +575,12 @@ def ensure_model(config: Config) -> None:
         token=config.env.get("HF_TOKEN") or None,
     )
     if not (config.model_path / "config.json").is_file():
-        raise RuntimeError("The NAS model download has no config.json")
+        raise RuntimeError("The model download has no config.json")
     revision = config.env.get("HF_REVISION", "").strip() or "main"
     temporary = config.model_path / f".lanllm-ready.{os.getpid()}"
     temporary.write_text(revision + "\n", encoding="ascii")
     temporary.replace(config.model_path / ".lanllm-ready")
-    print(f"Shared NAS model ready: {config.model_path}", flush=True)
+    print(f"Leader model ready: {config.model_path}", flush=True)
 
 
 def wait_for_model(config: Config, leader_ip: str) -> bool:
@@ -358,7 +593,7 @@ def wait_for_model(config: Config, leader_ip: str) -> bool:
                 return False
         else:
             failures = 0
-        print(f"Waiting for shared NAS model {config.model_id}", flush=True)
+        print(f"Waiting for leader model {config.model_id}", flush=True)
         time.sleep(5)
     return True
 
@@ -434,11 +669,26 @@ def reachable(ip: str, port: int) -> bool:
 
 
 def lower_priority_leader(config: Config) -> str | None:
+    local_store = Path("/models-local")
+    local_priority = int(
+        (local_store / ".lanllm-model").is_file()
+        or (local_store / "models" / config.model_id / ".lanllm-ready").is_file()
+    )
     for ip in config.peer_ips:
-        if ip == config.node_ip or ip_key(ip) >= ip_key(config.node_ip):
+        if ip == config.node_ip:
             continue
         peer = query_node(ip, config.control_port)
-        if peer is not None and peer.get("role") == "leader":
+        if (
+            peer is not None
+            and peer.get("role") == "leader"
+            and (
+                peer.get("store_priority", 0) > local_priority
+                or (
+                    peer.get("store_priority", 0) == local_priority
+                    and ip_key(ip) < ip_key(config.node_ip)
+                )
+            )
+        ):
             return ip
     return None
 
@@ -487,6 +737,26 @@ def run_leader(config: Config, state: State) -> None:
     state.set("leader", config.node_ip)
     if lower_priority_leader(config) is not None:
         return
+    while True:
+        peers = [
+            peer
+            for ip in config.peer_ips
+            if ip != config.node_ip
+            if (peer := query_node(ip, config.control_port, full=True)) is not None
+        ]
+        local_priority = state.identity()["store_priority"]
+        winner = elect_leader(config.node_ip, peers, local_priority)
+        available_gpus = config.local_gpus + sum(len(peer["gpus"]) for peer in peers)
+        if winner != config.node_ip:
+            return
+        if available_gpus >= config.total_gpus:
+            break
+        print(
+            f"Waiting for GPU inventory: {available_gpus}/{config.total_gpus}",
+            flush=True,
+        )
+        time.sleep(5)
+    registered_nodes(config, state)
     ensure_model(config)
     settings = config.settings(
         "head", config.node_ip, resolve_partition(config, config.node_ip)
@@ -511,11 +781,15 @@ def run_leader(config: Config, state: State) -> None:
             server = subprocess.Popen(
                 vllm_command(settings), env=runtime_environment(settings)
             )
+            last_registry_update = 0.0
             while server.poll() is None:
                 other_leader = lower_priority_leader(config)
                 if other_leader is not None:
                     print(f"Another leader won election at {other_leader}", flush=True)
                     return
+                if time.monotonic() - last_registry_update >= 15:
+                    registered_nodes(config, state)
+                    last_registry_update = time.monotonic()
                 time.sleep(3)
             print(f"vLLM exited with code {server.returncode}; restarting", flush=True)
     finally:
@@ -524,7 +798,7 @@ def run_leader(config: Config, state: State) -> None:
 
 
 def run(config: Config) -> None:
-    verify_model_store()
+    verify_model_store(Path("/models-local"))
     state = State(config)
     control = ControlServer(state)
     control_thread = threading.Thread(target=control.serve_forever, daemon=True)
@@ -533,8 +807,10 @@ def run(config: Config) -> None:
     def watch_selection() -> None:
         while True:
             time.sleep(2)
+            if not Path("/models").is_mount():
+                continue
             try:
-                changed = selected_model() not in (None, config.model_id)
+                changed = selected_model() not in (None, state.config.model_id)
             except (OSError, ValueError) as exc:
                 print(f"Model selection error: {exc}", flush=True)
                 continue
@@ -561,11 +837,22 @@ def run(config: Config) -> None:
                 if ip != config.node_ip
                 if (peer := query_node(ip, config.control_port)) is not None
             ]
-            leader_ip = elect_leader(config.node_ip, peers)
-            if leader_ip == config.node_ip:
-                run_leader(config, state)
-            else:
-                run_worker(config, state, leader_ip)
+            leader_ip = elect_leader(
+                config.node_ip, peers, state.identity()["store_priority"]
+            )
+            try:
+                mount_model_store(config, leader_ip)
+                active = replace(config, model_id=selected_model() or config.model_id)
+                state.config = active
+                if leader_ip == config.node_ip:
+                    run_leader(active, state)
+                else:
+                    run_worker(active, state, leader_ip)
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                print(f"Model store unavailable from {leader_ip}: {exc}", flush=True)
+            finally:
+                unmount_model_store()
+                state.config = config
             state.set("candidate", "")
             time.sleep(2)
     finally:

@@ -1,11 +1,16 @@
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from lanllm.cluster import (
     allocate_layers,
     elect_leader,
+    estimate_fit,
     format_status,
+    mount_model_store,
+    registered_nodes,
     selected_model,
     verify_model_store,
 )
@@ -37,12 +42,93 @@ class ElectionTests(unittest.TestCase):
     def test_no_peer_promotes_remaining_node(self) -> None:
         self.assertEqual(elect_leader("192.168.2.33", []), "192.168.2.33")
 
+    def test_node_with_model_store_becomes_leader(self) -> None:
+        self.assertEqual(
+            elect_leader(
+                "192.168.2.33",
+                [
+                    {
+                        "node_ip": "192.168.2.26",
+                        "role": "leader",
+                        "store_priority": 0,
+                    }
+                ],
+                local_priority=1,
+            ),
+            "192.168.2.33",
+        )
+        self.assertEqual(
+            elect_leader(
+                "192.168.2.26",
+                [
+                    {
+                        "node_ip": "192.168.2.33",
+                        "role": "candidate",
+                        "store_priority": 1,
+                    }
+                ],
+            ),
+            "192.168.2.33",
+        )
+
     def test_uneven_vram_gets_uneven_layers_in_either_rank_order(self) -> None:
         self.assertEqual(allocate_layers(48, [8188, 16303, 16376]), [8, 20, 20])
         self.assertEqual(allocate_layers(48, [16303, 16376, 8188]), [20, 20, 8])
 
 
 class StatusTests(unittest.TestCase):
+    def test_registry_keeps_last_known_worker_capacity_when_offline(self) -> None:
+        config = SimpleNamespace(
+            node_ip="192.168.2.33",
+            peer_ips=("192.168.2.33", "192.168.2.26"),
+            control_port=8501,
+        )
+        local = {
+            "node_ip": "192.168.2.33",
+            "role": "leader",
+            "gpus": [{"index": "0", "name": "RTX A4000", "total_mib": "16376"}],
+            "cpus": 16,
+            "ram_total_gib": 32.0,
+        }
+        worker = {
+            "node_ip": "192.168.2.26",
+            "role": "worker",
+            "gpus": [{"index": "0", "name": "RTX 4070", "total_mib": "8188"}],
+            "cpus": 8,
+            "ram_total_gib": 16.0,
+        }
+        state = SimpleNamespace(snapshot=lambda: local)
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch("lanllm.cluster.query_node", side_effect=[worker, None]):
+                first = registered_nodes(config, state, root)
+                second = registered_nodes(config, state, root)
+        self.assertTrue(first[1]["online"])
+        self.assertFalse(second[1]["online"])
+        self.assertEqual(second[1]["gpus"], first[1]["gpus"])
+        self.assertEqual(second[1]["ram_total_gib"], 16.0)
+
+    def test_weight_fit_distinguishes_leader_and_registered_pool(self) -> None:
+        self.assertEqual(estimate_fit(1_000_000_000, 25_314, 30_635), "leader")
+        self.assertEqual(estimate_fit(29_540_134_000, 25_314, 30_635), "pool")
+        self.assertEqual(estimate_fit(70_000_000_000, 25_314, 30_635), "too_large")
+
+    def test_worker_mounts_leader_advertised_directory(self) -> None:
+        config = SimpleNamespace(node_ip="192.168.2.26", control_port=8501)
+        leader = {
+            "role": "leader",
+            "model_store_dir": "/disks/models/lanllm",
+        }
+        with (
+            patch.object(Path, "is_mount", return_value=False),
+            patch("lanllm.cluster.query_node", return_value=leader),
+            patch("lanllm.cluster.subprocess.run") as run,
+            patch("lanllm.cluster.verify_model_store"),
+        ):
+            mount_model_store(config, "192.168.2.33")
+        command = run.call_args.args[0]
+        self.assertIn("192.168.2.33:/disks/models/lanllm", command)
+
     def test_status_sums_per_gpu_memory(self) -> None:
         states = [
             {
@@ -74,7 +160,7 @@ class StatusTests(unittest.TestCase):
     def test_unmounted_store_is_rejected(self) -> None:
         with TemporaryDirectory() as directory:
             store = Path(directory)
-            with self.assertRaisesRegex(ValueError, "shared NAS model store"):
+            with self.assertRaisesRegex(ValueError, "LanLLM model store"):
                 verify_model_store(store)
             (store / ".lanllm-store").write_text("lanllm-model-store-v1\n")
             verify_model_store(store)

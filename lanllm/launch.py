@@ -82,7 +82,7 @@ class Settings:
             model_source=env.get("MODEL_SOURCE", "").strip() or required("MODEL_ID"),
             ray_port=positive("RAY_PORT", "6379"),
             api_host=env.get("API_HOST", "127.0.0.1"),
-            api_port=positive("API_PORT", "8000"),
+            api_port=positive("API_PORT", "8001"),
             max_model_len=positive("MAX_MODEL_LEN", "1024"),
             gpu_memory_utilization=utilization,
             attention_backend=env.get("ATTENTION_BACKEND", "FLASH_ATTN"),

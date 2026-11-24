@@ -6,6 +6,7 @@ services:
     build: .
     network_mode: host
     ipc: host
+    privileged: true
     devices:
       - nvidia.com/gpu=all
     restart: unless-stopped
@@ -14,18 +15,19 @@ services:
     environment:
       PEER_IPS: ${PEER_IPS:?List all LAN node IPs in .env}
       MODEL_ID: ${MODEL_ID:?Set a Hugging Face model ID in .env}
+      MODEL_STORE_DIR: ${MODEL_STORE_DIR:-/srv/lanllm-store}
       TOTAL_GPUS: ${TOTAL_GPUS:-3}
       NODE_IP: ${NODE_IP:-}
       NETWORK_INTERFACE: ${NETWORK_INTERFACE:-}
       CONTROL_PORT: ${CONTROL_PORT:-8501}
       RAY_PORT: ${RAY_PORT:-6379}
-      API_PORT: ${API_PORT:-8000}
+      API_PORT: ${API_PORT:-8001}
       MAX_MODEL_LEN: ${MAX_MODEL_LEN:-1024}
       GPU_MEMORY_UTILIZATION: ${GPU_MEMORY_UTILIZATION:-0.7}
       ATTENTION_BACKEND: ${ATTENTION_BACKEND:-FLASH_ATTN}
       ENFORCE_EAGER: ${ENFORCE_EAGER:-1}
       HF_TOKEN: ${HF_TOKEN:-}
-      HF_HOME: /models/.hf-cache
+      HF_HOME: /root/.cache/huggingface
       HF_REVISION: ${HF_REVISION:-}
       QUANTIZATION: ${QUANTIZATION:-}
       DTYPE: ${DTYPE:-}
@@ -34,8 +36,12 @@ services:
       POOL_WAIT_TIMEOUT: ${POOL_WAIT_TIMEOUT:-600}
     volumes:
       - type: bind
-        source: ${HOME}/Escritorio/disk1/LanLLM
-        target: /models
+        source: ${MODEL_STORE_DIR:-/srv/lanllm-store}
+        target: /models-local
         bind:
           create_host_path: false
-      - ${HOME}/.cache/vllm:/root/.cache/vllm
+      - type: bind
+        source: ${HOME}/.cache/lanllm/vllm
+        target: /root/.cache/vllm
+        bind:
+          create_host_path: false

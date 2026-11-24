@@ -2,36 +2,95 @@
 """Host command for the LanLLM pool; status does not require Docker."""
 
 import argparse
+import ipaddress
+import json
 import os
+import shutil
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 REPOSITORY = Path(__file__).resolve().parents[1]
+MANAGED_STORES = Path("/var/lib/lanllm/model-dirs")
 sys.path.insert(0, str(REPOSITORY))
 
 from lanllm.cluster import (  # noqa: E402
     MODEL_ID_PATTERN,
     format_status,
+    local_ip_for,
     query_node,
     selected_model,
     verify_model_store,
 )
 
-MODEL_STORE = Path.home() / "Escritorio/disk1/LanLLM"
-
 
 def configuration() -> dict[str, str]:
     values = {}
     path = REPOSITORY / ".env"
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line and not line.startswith("#"):
-            key, separator, value = line.partition("=")
-            if separator:
-                values[key.strip()] = value.strip()
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                key, separator, value = line.partition("=")
+                if separator:
+                    values[key.strip()] = value.strip()
+    config_path = REPOSITORY / "lanllm.conf"
+    if config_path.exists():
+        with config_path.open("rb") as source:
+            config = tomllib.load(source)
+        cluster = config.get("cluster", {})
+        models = config.get("models", {})
+        inference = config.get("inference", {})
+        api = config.get("api", {})
+        if "peers" in cluster:
+            peers = cluster["peers"]
+            if not isinstance(peers, list) or not all(
+                isinstance(peer, str) for peer in peers
+            ):
+                raise ValueError("cluster.peers must be a list of IP addresses")
+            values["PEER_IPS"] = ",".join(peers)
+        mapping = (
+            (cluster, "total_gpus", "TOTAL_GPUS"),
+            (models, "directory", "MODEL_STORE_DIR"),
+            (models, "default_id", "MODEL_ID"),
+            (models, "revision", "HF_REVISION"),
+            (models, "token", "HF_TOKEN"),
+            (inference, "max_model_len", "MAX_MODEL_LEN"),
+            (inference, "gpu_memory_utilization", "GPU_MEMORY_UTILIZATION"),
+            (inference, "layer_partition", "LAYER_PARTITION"),
+            (inference, "quantization", "QUANTIZATION"),
+            (inference, "dtype", "DTYPE"),
+            (inference, "trust_remote_code", "TRUST_REMOTE_CODE"),
+            (api, "port", "API_PORT"),
+            (api, "control_port", "CONTROL_PORT"),
+        )
+        for section, key, env_name in mapping:
+            if key in section:
+                value = section[key]
+                values[env_name] = (
+                    ("1" if value else "0") if isinstance(value, bool) else str(value)
+                )
+        if "MODEL_STORE_DIR" in values:
+            values["MODEL_STORE_DIR"] = str(
+                Path(values["MODEL_STORE_DIR"]).expanduser()
+            )
     return values
+
+
+def model_store(values: dict[str, str]) -> Path:
+    path = Path(values.get("MODEL_STORE_DIR", "/srv/lanllm-store"))
+    if (
+        not path.is_absolute()
+        or len(path.parts) < 3
+        or any(char.isspace() for char in str(path))
+    ):
+        raise ValueError("models.directory must be an absolute path without spaces")
+    if path.is_symlink():
+        raise ValueError("models.directory cannot be a symlink")
+    return path
 
 
 def status() -> int:
@@ -40,7 +99,7 @@ def status() -> int:
     if not peers:
         raise ValueError("PEER_IPS is missing from the LanLLM .env file")
     port = int(values.get("CONTROL_PORT", "8501"))
-    api_port = int(values.get("API_PORT", "8000"))
+    api_port = int(values.get("API_PORT", "8001"))
     states = []
     offline = []
     for ip in peers:
@@ -53,10 +112,273 @@ def status() -> int:
     return 0 if states else 1
 
 
+def leader_endpoint(values: dict[str, str], endpoint: str) -> dict:
+    port = int(values.get("CONTROL_PORT", "8501"))
+    states = [query_node(ip, port, timeout=2) for ip in peer_ips(values)]
+    leaders = [state for state in states if state and state["role"] == "leader"]
+    if not leaders:
+        raise ValueError("No LanLLM leader is online")
+    with urlopen(f"http://{leaders[0]['node_ip']}:{port}/{endpoint}", timeout=10) as response:
+        return json.load(response)
+
+
+def nodes() -> int:
+    data = leader_endpoint(configuration(), "nodes")
+    entries = data["nodes"]
+    registered = sum(bool(node["gpus"]) for node in entries)
+    online = sum(node["online"] for node in entries)
+    print(f"LanLLM nodes: {registered} registered, {online} online")
+    print(
+        f"{'Node':<17} {'Role':<10} {'GPUs':>4} {'VRAM':>12} "
+        f"{'CPUs':>5} {'RAM':>9}  GPU names"
+    )
+    for node in entries:
+        gpus = node["gpus"]
+        total_mib = sum(int(gpu["total_mib"]) for gpu in gpus)
+        names = ", ".join(gpu["name"] for gpu in gpus) or "not registered"
+        cpus = str(node["cpus"]) if node["cpus"] is not None else "?"
+        ram = (
+            f"{node['ram_total_gib']:.1f} GiB"
+            if node["ram_total_gib"] is not None
+            else "?"
+        )
+        print(
+            f"{node['node_ip']:<17} {node['role']:<10} {len(gpus):>4} "
+            f"{total_mib:>8,} MiB {cpus:>5} {ram:>9}  {names}"
+        )
+    return 0
+
+
+def models() -> int:
+    data = leader_endpoint(configuration(), "models")
+    leader_gib = data["leader_usable_mib"] / 1024
+    pool_gib = data["registered_usable_mib"] / 1024
+    print(
+        f"Model fit estimate: leader {leader_gib:.1f} GiB, "
+        f"registered pool {pool_gib:.1f} GiB "
+        f"({data['online_nodes']}/{data['registered_nodes']} nodes online)"
+    )
+    print(f"{'Model':<42} {'Weights':>10}  Fit")
+    for entry in data["models"]:
+        fit = {
+            "leader": "leader alone",
+            "pool": "registered pool",
+            "too_large": "too large",
+            "unknown": "unknown",
+        }[entry["fit"]]
+        if entry["fit"] == "pool" and not entry["fits_online_vram"]:
+            fit += " (worker offline)"
+        gib = entry["weight_bytes"] / (1024**3)
+        print(f"{entry['model_id']:<42} {gib:>8.1f} GiB  {fit}")
+    if not data["models"]:
+        print("No downloaded models in the leader store")
+    print("Estimate reserves 2 GiB per GPU for runtime and KV cache.")
+    return 0
+
+
+def peer_ips(values: dict[str, str]) -> list[str]:
+    peers = [ip.strip() for ip in values.get("PEER_IPS", "").split(",") if ip.strip()]
+    if not peers:
+        raise ValueError("PEER_IPS is missing from the LanLLM .env file")
+    for ip in peers:
+        if not isinstance(ipaddress.ip_address(ip), ipaddress.IPv4Address):
+            raise ValueError("LanLLM currently requires IPv4 peer addresses")
+    return peers
+
+
+def sudo(*command: str, input_text: str | None = None) -> None:
+    subprocess.run(
+        ["sudo", "-n", *command],
+        input=input_text,
+        text=True,
+        stdout=subprocess.DEVNULL,
+        check=True,
+    )
+
+
+def setup_store() -> None:
+    values = configuration()
+    store = model_store(values)
+    peers = peer_ips(values)
+    node_ip = values.get("NODE_IP", "").strip() or local_ip_for(peers[0])
+    if node_ip not in peers:
+        raise ValueError(f"This host's address {node_ip} is absent from PEER_IPS")
+    if shutil.which("exportfs") is None and not Path("/usr/sbin/exportfs").exists():
+        sudo("env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "update", "-qq")
+        sudo(
+            "env",
+            "DEBIAN_FRONTEND=noninteractive",
+            "apt-get",
+            "install",
+            "-y",
+            "-qq",
+            "nfs-kernel-server",
+        )
+        sudo("install", "-d", "-m", "0755", "/var/lib/lanllm")
+        sudo(
+            "tee",
+            "/var/lib/lanllm/owned-nfs-server",
+            input_text="installed-by-lanllm\n",
+        )
+    if (
+        store.exists()
+        and not (store / ".lanllm-store").exists()
+        and any(store.iterdir())
+    ):
+        raise ValueError(f"Model directory is not empty: {store}")
+    sudo("install", "-d", "-m", "0755", str(store))
+    marker = store / ".lanllm-store"
+    if not marker.exists():
+        sudo("tee", str(marker), input_text="lanllm-model-store-v1\n")
+    verify_model_store(store)
+    sudo("install", "-d", "-m", "0755", "/var/lib/lanllm")
+    recorded = (
+        MANAGED_STORES.read_text().splitlines() if MANAGED_STORES.exists() else []
+    )
+    if str(store) not in recorded:
+        sudo("tee", "-a", str(MANAGED_STORES), input_text=str(store) + "\n")
+    sudo("install", "-d", "-m", "0755", "/etc/exports.d")
+    clients = " ".join(
+        f"{ip}(ro,sync,no_subtree_check,root_squash)" for ip in peers if ip != node_ip
+    )
+    if clients:
+        sudo(
+            "tee",
+            "/etc/exports.d/lanllm.exports",
+            input_text=f"{store} {clients}\n",
+        )
+    sudo("systemctl", "enable", "--now", "nfs-server")
+    sudo("exportfs", "-ra")
+    (Path.home() / ".cache/lanllm/vllm").mkdir(parents=True, exist_ok=True)
+
+
+def other_nfs_exports() -> bool:
+    files = [Path("/etc/exports"), *Path("/etc/exports.d").glob("*.exports")]
+    for path in files:
+        if path.name == "lanllm.exports" or not path.exists():
+            continue
+        if any(
+            line.strip() and not line.lstrip().startswith("#")
+            for line in path.read_text(encoding="utf-8").splitlines()
+        ):
+            return True
+    return False
+
+
+def uninstall(*, keep_source: bool, dry_run: bool) -> int:
+    values = configuration()
+    configured_store = model_store(values)
+    recorded = (
+        MANAGED_STORES.read_text().splitlines() if MANAGED_STORES.exists() else []
+    )
+    stores = [
+        model_store({"MODEL_STORE_DIR": value})
+        for value in dict.fromkeys([*recorded, str(configured_store)])
+    ]
+    for store in stores:
+        if not store.exists():
+            continue
+        verify_model_store(store)
+        allowed = {
+            ".lanllm-store",
+            ".lanllm-model",
+            ".lanllm-nodes.json",
+            "models",
+            ".hf-cache",
+        }
+        unknown = [
+            entry.name
+            for entry in store.iterdir()
+            if entry.name not in allowed
+            and not entry.name.startswith(".lanllm-model.")
+            and not entry.name.startswith(".lanllm-nodes.")
+        ]
+        if unknown:
+            raise ValueError(f"Model directory contains unrecognized files: {unknown}")
+    if dry_run:
+        print("Would stop and remove the LanLLM container and image")
+        for store in stores:
+            if store.exists():
+                print(f"Would remove model directory: {store}")
+        cache = Path.home() / ".cache/lanllm"
+        if cache.exists():
+            print(f"Would remove project cache: {cache}")
+        if Path("/etc/exports.d/lanllm.exports").exists():
+            print("Would remove NFS export: /etc/exports.d/lanllm.exports")
+        if Path("/var/lib/lanllm/owned-nfs-server").exists():
+            print("Would remove the NFS server package if no other exports need it")
+        print("Would remove /usr/local/bin/lanllm if it points to this checkout")
+        if not keep_source:
+            print(f"Would remove repository checkout: {REPOSITORY}")
+        return 0
+    environment = os.environ.copy() | values
+    subprocess.run(
+        ["docker", "compose", "down", "--remove-orphans"],
+        cwd=REPOSITORY,
+        env=environment,
+        check=True,
+    )
+    export = Path("/etc/exports.d/lanllm.exports")
+    if export.exists():
+        sudo("rm", "--", str(export))
+        sudo("exportfs", "-ra")
+    for store in stores:
+        if store.exists():
+            sudo("rm", "-r", "--", str(store))
+    cache = Path.home() / ".cache/lanllm"
+    if cache.exists():
+        sudo("rm", "-r", "--", str(cache))
+    image_exists = (
+        subprocess.run(
+            ["docker", "image", "inspect", "lanllm:local"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).returncode
+        == 0
+    )
+    if image_exists:
+        subprocess.run(["docker", "image", "rm", "lanllm:local"], check=True)
+    package_marker = Path("/var/lib/lanllm/owned-nfs-server")
+    if package_marker.exists():
+        if not other_nfs_exports():
+            sudo("systemctl", "disable", "--now", "nfs-server")
+            sudo(
+                "env",
+                "DEBIAN_FRONTEND=noninteractive",
+                "apt-get",
+                "remove",
+                "--purge",
+                "-y",
+                "nfs-kernel-server",
+            )
+        sudo("rm", "--", str(package_marker))
+    if MANAGED_STORES.exists():
+        sudo("rm", "--", str(MANAGED_STORES))
+    state_dir = Path("/var/lib/lanllm")
+    if state_dir.exists() and not any(state_dir.iterdir()):
+        sudo("rmdir", str(state_dir))
+    command = Path("/usr/local/bin/lanllm")
+    if command.is_symlink() and command.resolve() == REPOSITORY / "bin/lanllm":
+        sudo("rm", "--", str(command))
+    if not keep_source:
+        shutil.rmtree(REPOSITORY)
+    print("LanLLM removed from this node")
+    return 0
+
+
 def model(model_id: str | None) -> int:
-    verify_model_store(MODEL_STORE)
+    values = configuration()
+    store = model_store(values)
+    states = [
+        query_node(ip, int(values.get("CONTROL_PORT", "8501")), timeout=2, full=True)
+        for ip in peer_ips(values)
+    ]
+    leaders = [state for state in states if state and state["role"] == "leader"]
+    leader = leaders[0] if leaders else None
     if model_id is None:
-        print(selected_model(MODEL_STORE) or configuration().get("MODEL_ID", ""))
+        current = leader["model_id"] if leader else None
+        print(current or selected_model(store) or values.get("MODEL_ID", ""))
         return 0
     if model_id.startswith("https://"):
         url = urlparse(model_id)
@@ -65,10 +387,24 @@ def model(model_id: str | None) -> int:
         model_id = url.path.strip("/")
     if not MODEL_ID_PATTERN.fullmatch(model_id) or ".." in model_id:
         raise ValueError("model must be a Hugging Face repository ID")
-    temporary = MODEL_STORE / f".lanllm-model.{os.getpid()}"
-    temporary.write_text(model_id + "\n", encoding="utf-8")
-    temporary.replace(MODEL_STORE / ".lanllm-model")
-    print(f"Selected {model_id}; nodes will load it from the shared NAS")
+    if leader is None:
+        raise ValueError("Start the GPU pool before selecting a model")
+    online_gpus = sum(len(state["gpus"]) for state in states if state)
+    required_gpus = int(values.get("TOTAL_GPUS", "3"))
+    if online_gpus < required_gpus:
+        raise ValueError(
+            f"Only {online_gpus}/{required_gpus} GPUs are online; "
+            "start the missing worker before selecting a model"
+        )
+    request = Request(
+        f"http://{leader['node_ip']}:{values.get('CONTROL_PORT', '8501')}/model",
+        data=json.dumps({"model_id": model_id}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlopen(request, timeout=15):
+        pass
+    print(f"Selected {model_id} on leader {leader['node_ip']}")
     return 0
 
 
@@ -78,29 +414,47 @@ def main() -> int:
         "action",
         nargs="?",
         default="status",
-        choices=("status", "start", "stop", "logs", "model"),
+        choices=("status", "nodes", "models", "start", "stop", "logs", "model", "uninstall"),
     )
     parser.add_argument("model_id", nargs="?")
+    parser.add_argument(
+        "--keep-source", action="store_true", help="Keep the repository on uninstall"
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Preview uninstall without deleting"
+    )
     args = parser.parse_args()
+    if args.action == "uninstall":
+        return uninstall(keep_source=args.keep_source, dry_run=args.dry_run)
+    if args.keep_source:
+        parser.error("--keep-source is only accepted with 'uninstall'")
+    if args.dry_run:
+        parser.error("--dry-run is only accepted with 'uninstall'")
     if args.action == "model":
         return model(args.model_id)
     if args.model_id is not None:
         parser.error("a model ID is only accepted after 'model'")
     if args.action == "status":
         return status()
+    if args.action == "nodes":
+        return nodes()
+    if args.action == "models":
+        return models()
     command = {
         "start": ["docker", "compose", "up", "-d", "--build"],
         "stop": ["docker", "compose", "down"],
         "logs": ["docker", "compose", "logs", "-f", "node"],
     }[args.action]
+    if args.action == "start":
+        setup_store()
     return subprocess.run(
-        command, cwd=REPOSITORY, env=os.environ.copy(), check=False
+        command, cwd=REPOSITORY, env=os.environ.copy() | configuration(), check=False
     ).returncode
 
 
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
         print(f"lanllm: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
