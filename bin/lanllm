@@ -5,11 +5,13 @@ import argparse
 import ipaddress
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
 import time
 import tomllib
+from collections import defaultdict, deque
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import urlparse
@@ -29,6 +31,7 @@ from lanllm.cluster import (  # noqa: E402
     verify_model_store,
 )
 from lanllm.model_sources import parse_source  # noqa: E402
+from lanllm.dashboard import poll_nodes, render_dashboard, run_dashboard  # noqa: E402
 
 
 def configuration() -> dict[str, str]:
@@ -133,7 +136,9 @@ def leader_url(values: dict[str, str], endpoint: str) -> str:
     return f"http://{leaders[0]['node_ip']}:{port}/{endpoint}"
 
 
-def post_leader(values: dict[str, str], endpoint: str, data: dict) -> dict:
+def post_leader(
+    values: dict[str, str], endpoint: str, data: dict, timeout: int = 15
+) -> dict:
     request = Request(
         leader_url(values, endpoint),
         data=json.dumps(data).encode(),
@@ -141,11 +146,15 @@ def post_leader(values: dict[str, str], endpoint: str, data: dict) -> dict:
         method="POST",
     )
     try:
-        with urlopen(request, timeout=15) as response:
+        with urlopen(request, timeout=timeout) as response:
             return json.load(response)
     except HTTPError as exc:
+        try:
+            detail = json.load(exc).get("error")
+        except (ValueError, AttributeError):
+            detail = None
         raise ValueError(
-            f"Leader rejected request: HTTP {exc.code} {exc.reason}"
+            detail or f"Leader rejected request: HTTP {exc.code} {exc.reason}"
         ) from exc
 
 
@@ -170,7 +179,7 @@ def download(source: str | None, backend: str | None, filename: str) -> int:
             print(line, flush=True)
             previous = line
         if job["status"] == "ready":
-            print(f"Ready: {job['ref']}. Serve it with: lanllm model {job['ref']}")
+            print(f"Ready: {job['ref']}. Serve it with: lanllm model switch {job['ref']}")
             return 0
         if job["status"] == "error":
             raise ValueError(job.get("error", "Download failed"))
@@ -178,6 +187,74 @@ def download(source: str | None, backend: str | None, filename: str) -> int:
             print("No model download is running")
             return 0
         time.sleep(2)
+
+
+def fit(source: str, backend: str | None, filename: str, apply: bool) -> int:
+    values = configuration()
+    plan = post_leader(
+        values,
+        "fit",
+        {"source": source, "backend": backend, "file": filename},
+        timeout=60,
+    )
+    print(
+        f"Online GPUs: {plan['online_gpus']}/{plan['required_gpus']}  |  "
+        f"Usable VRAM: leader {plan['leader_usable_bytes'] / 2**30:.1f} GiB, "
+        f"online pool {plan['online_usable_bytes'] / 2**30:.1f} GiB"
+    )
+    print()
+    for item in plan["variants"]:
+        marker = "*" if item == plan["recommended"] else " "
+        size = item["weight_bytes"] / 2**30
+        fit_label = {"leader": "leader", "pool": "pool", "too_large": "too large"}[item["fit"]]
+        if item["tight"] and item["fit"] != "too_large":
+            fit_label += ", tight"
+        print(f"{marker} {item['ref']}")
+        print(f"    {size:.1f} GiB  |  {item['backend']}  |  {fit_label}")
+    print("\n* Recommended. Estimate reserves 2 GiB per GPU and prefers 10% extra headroom.")
+    print("  Actual runtime fit also depends on context, architecture, and backend.")
+    recommendation = plan["recommended"]
+    if recommendation is None:
+        print("No variant fits the GPUs currently online. Try a quantized model repository.")
+        if apply:
+            raise ValueError("No fitting variant to download")
+        return 0
+    if apply:
+        if plan["online_gpus"] < plan["required_gpus"]:
+            raise ValueError("Start the missing GPU worker before applying a model fit")
+        download(
+            recommendation["source"],
+            recommendation["backend"],
+            recommendation["file"],
+        )
+        return model(recommendation["ref"])
+    command = [
+        "lanllm", "fit", recommendation["source"],
+        "--backend", recommendation["backend"],
+    ]
+    if recommendation["file"]:
+        command += ["--file", recommendation["file"]]
+    command.append("--apply")
+    print("\nDownload and switch: " + shlex.join(command))
+    return 0
+
+
+def top(once: bool, interval: float) -> int:
+    if not 0.5 <= interval <= 10:
+        raise ValueError("--interval must be between 0.5 and 10 seconds")
+    values = configuration()
+    peers = peer_ips(values)
+    port = int(values.get("CONTROL_PORT", "8501"))
+    api_port = int(values.get("API_PORT", "8001"))
+    if once or not sys.stdout.isatty():
+        states, offline = poll_nodes(peers, port)
+        history = defaultdict(lambda: deque(maxlen=30))
+        print("\n".join(render_dashboard(
+            states, offline, shutil.get_terminal_size((80, 24)).columns,
+            api_port, history,
+        )))
+        return 0 if states else 1
+    return run_dashboard(peers, port, api_port, interval)
 
 
 def nodes() -> int:
@@ -516,6 +593,8 @@ def main() -> int:
             "status",
             "nodes",
             "models",
+            "top",
+            "fit",
             "download",
             "start",
             "stop",
@@ -527,6 +606,9 @@ def main() -> int:
     )
     parser.add_argument("model_id", nargs="?")
     parser.add_argument("switch_model_id", nargs="?")
+    parser.add_argument("--apply", action="store_true", help="Download and switch to the recommended fit")
+    parser.add_argument("--once", action="store_true", help="Print one dashboard snapshot")
+    parser.add_argument("--interval", type=float, default=1.0, help="Dashboard refresh in seconds")
     parser.add_argument("--backend", choices=("vllm", "llama.cpp"))
     parser.add_argument(
         "--file", default="", help="GGUF filename in a Hugging Face repository"
@@ -542,12 +624,24 @@ def main() -> int:
         return uninstall(keep_source=args.keep_source, dry_run=args.dry_run)
     if args.action == "download":
         return download(args.model_id, args.backend, args.file)
+    if args.action == "fit":
+        if not args.model_id or args.switch_model_id:
+            parser.error("use 'lanllm fit <model source> [--apply]'")
+        return fit(args.model_id, args.backend, args.file, args.apply)
     if args.backend or args.file:
-        parser.error("--backend and --file are only accepted with 'download'")
+        parser.error("--backend and --file are only accepted with 'download' or 'fit'")
+    if args.apply:
+        parser.error("--apply is only accepted with 'fit'")
     if args.keep_source:
         parser.error("--keep-source is only accepted with 'uninstall'")
     if args.dry_run:
         parser.error("--dry-run is only accepted with 'uninstall'")
+    if args.action == "top":
+        if args.model_id or args.switch_model_id:
+            parser.error("use 'lanllm top [--once] [--interval seconds]'")
+        return top(args.once, args.interval)
+    if args.once:
+        parser.error("--once is only accepted with 'top'")
     if args.action == "model":
         if args.model_id == "switch":
             if not args.switch_model_id:

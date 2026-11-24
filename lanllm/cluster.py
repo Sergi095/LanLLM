@@ -21,6 +21,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from lanllm.model_sources import download_model, model_metadata, parse_source
+from lanllm.metrics import SystemSampler
 from lanllm.launch import (
     Settings,
     ray_command,
@@ -207,6 +208,7 @@ class State:
         self.role = "candidate"
         self.leader_ip = ""
         self.lock = threading.Lock()
+        self.system_sampler = SystemSampler(config.network_interface)
 
     def set(self, role: str, leader_ip: str) -> None:
         with self.lock:
@@ -246,6 +248,7 @@ class State:
             "cpus": os.cpu_count(),
             "ram_total_gib": round(total_ram, 1),
             "ram_available_gib": round(available_ram, 1),
+            **self.system_sampler.sample(),
         }
 
 
@@ -279,7 +282,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def do_POST(self) -> None:
-        if self.path not in {"/model", "/download"}:
+        if self.path not in {"/model", "/download", "/fit"}:
             self.send_error(404)
             return
         if self.client_address[0] not in self.server.state.config.peer_ips:
@@ -297,6 +300,30 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 raise ValueError("Expected a JSON object")
         except (ValueError, TypeError) as exc:
             self.send_error(400, str(exc))
+            return
+        if self.path == "/fit":
+            from .fit import choose_fit
+
+            try:
+                config = self.server.state.config
+                nodes = registered_nodes(config, self.server.state)
+                catalog = model_catalog(config, nodes)
+                plan = choose_fit(
+                    data["source"],
+                    data.get("backend"),
+                    data.get("file", ""),
+                    catalog["leader_usable_mib"] * 1048576,
+                    catalog["online_usable_mib"] * 1048576,
+                    config.env.get("HF_TOKEN") or None,
+                )
+                plan["online_gpus"] = sum(
+                    len(node["gpus"]) for node in nodes if node["online"]
+                )
+                plan["required_gpus"] = config.total_gpus
+            except Exception as exc:
+                self.reply_json({"error": str(exc)}, status=400)
+                return
+            self.reply_json(plan)
             return
         if self.path == "/download":
             try:
@@ -362,9 +389,9 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
             return
         self.reply_json({"model_id": model_id})
 
-    def reply_json(self, data: dict) -> None:
+    def reply_json(self, data: dict, status: int = 200) -> None:
         payload = json.dumps(data).encode()
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()

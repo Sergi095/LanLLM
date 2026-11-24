@@ -73,6 +73,11 @@ and reserves 2 GiB per GPU for runtime and KV cache; actual inference may
 need more memory. It shows the backend for each model. Models that have not
 been downloaded are not listed.
 
+`lanllm top` opens a live terminal dashboard with CPU, RAM, network, GPU
+utilization, VRAM, temperature, and power for every reachable node. Press `q`
+to leave it. Use `lanllm top --once` for a single snapshot in scripts or
+terminals without interactive display support.
+
 `cluster.peers` in `lanllm.conf` lists every node. Set the same model ID and
 GPU count on all nodes. The first node can start alone; it waits for the
 other GPU inventory and the requested GPU count before serving. Start the
@@ -91,6 +96,10 @@ http://<node-a-lan-ip>:8001/v1
 http://<node-b-lan-ip>:8001/v1
 ```
 
+Clients should use the active model's `max_model_len` from `/v1/models` as
+their context limit. A request that includes a large system prompt or many
+tool definitions may exceed that limit before its user message is counted.
+
 Only one inference server can bind port 8001 on a host at a time. Change
 `api.port` on every node if another service uses it.
 
@@ -103,6 +112,23 @@ curl http://127.0.0.1:8001/v1/chat/completions \
 ```
 
 ## Use another model
+
+Inspect a Hugging Face repository or Ollama library entry before downloading:
+
+```bash
+lanllm fit owner/repository
+lanllm fit owner/gguf-repository --backend llama.cpp
+lanllm fit ollama:model:tag
+lanllm fit owner/repository --apply
+```
+
+The fit command compares weight sizes with the GPUs currently online, reserves
+2 GiB per GPU for runtime, and prefers a further 10% headroom. It selects a
+vLLM checkpoint or a single-file GGUF variant within the requested source.
+`--apply` downloads the recommendation into the shared folder and switches to
+it when all configured GPUs are online. The estimate cannot guarantee that an
+architecture, context length, or workload will run. For a model that is too
+large, provide a quantized repository or a smaller model.
 
 Download on either host; the leader stores one copy in `models.directory`:
 
