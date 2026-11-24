@@ -96,9 +96,9 @@ http://<node-a-lan-ip>:8001/v1
 http://<node-b-lan-ip>:8001/v1
 ```
 
-Clients should use the active model's `max_model_len` from `/v1/models` as
-their context limit. A request that includes a large system prompt or many
-tool definitions may exceed that limit before its user message is counted.
+Clients can read the active model's context limit from `max_model_len` or
+`meta.n_ctx` in `/v1/models`. A request that includes a large system prompt or
+many tool definitions may exceed that limit before its user message is counted.
 
 Only one inference server can bind port 8001 on a host at a time. Change
 `api.port` on every node if another service uses it.

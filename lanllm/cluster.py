@@ -800,9 +800,17 @@ def wait_for_model(config: Config, leader_ip: str) -> bool:
 
 class ProxyHandler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
+        if self.server.annotate_models:
+            try:
+                prefix = self.request.recv(4096, socket.MSG_PEEK)
+                if prefix.startswith(b"GET /v1/models "):
+                    self.serve_models()
+                    return
+            except OSError:
+                return
         try:
             upstream = socket.create_connection(
-                (self.server.leader_ip, self.server.api_port), timeout=3
+                (self.server.upstream_ip, self.server.upstream_port), timeout=3
             )
         except OSError:
             message = b"LanLLM leader is starting"
@@ -834,14 +842,60 @@ class ProxyHandler(socketserver.BaseRequestHandler):
             copy(upstream, self.request)
             send.join(timeout=1)
 
+    def serve_models(self) -> None:
+        self.request.settimeout(3)
+        request = bytearray()
+        while b"\r\n\r\n" not in request and len(request) < 65536:
+            chunk = self.request.recv(4096)
+            if not chunk:
+                return
+            request.extend(chunk)
+        if b"\r\n\r\n" not in request:
+            return
+        try:
+            with urllib.request.urlopen(
+                f"http://{self.server.upstream_ip}:{self.server.upstream_port}/v1/models",
+                timeout=5,
+            ) as response:
+                payload = annotate_model_context(json.load(response))
+            body = json.dumps(payload).encode()
+            self.request.sendall(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: application/json\r\n"
+                + f"Content-Length: {len(body)}\r\n".encode()
+                + b"Connection: close\r\n\r\n"
+                + body
+            )
+        except (OSError, ValueError, urllib.error.URLError):
+            body = b"LanLLM leader is starting"
+            self.request.sendall(
+                b"HTTP/1.1 503 Service Unavailable\r\n"
+                + f"Content-Length: {len(body)}\r\n".encode()
+                + b"Connection: close\r\n\r\n"
+                + body
+            )
+
+
+def annotate_model_context(payload: dict) -> dict:
+    """Advertise vLLM context in the field used by local-model clients."""
+    for model in payload.get("data", []):
+        length = model.get("max_model_len")
+        if isinstance(length, int) and length > 0:
+            model.setdefault("meta", {})["n_ctx"] = length
+    return payload
+
 
 class ProxyServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, config: Config, leader_ip: str):
-        self.leader_ip = leader_ip
-        self.api_port = config.api_port
+    def __init__(
+        self, config: Config, upstream_ip: str, upstream_port: int | None = None,
+        annotate_models: bool = False,
+    ):
+        self.upstream_ip = upstream_ip
+        self.upstream_port = upstream_port or config.api_port
+        self.annotate_models = annotate_models
         super().__init__(("0.0.0.0", config.api_port), ProxyHandler)
 
 
@@ -1033,6 +1087,17 @@ def run_leader(config: Config, state: State) -> None:
     settings = config.settings(
         "head", config.node_ip, resolve_partition(config, config.node_ip)
     )
+    internal_port = config.api_port + 10000
+    if internal_port > 65535:
+        raise ValueError("API_PORT must be at most 55535")
+    inference_settings = replace(
+        settings, api_host="127.0.0.1", api_port=internal_port
+    )
+    public_proxy = ProxyServer(
+        config, "127.0.0.1", internal_port, annotate_models=True
+    )
+    proxy_thread = threading.Thread(target=public_proxy.serve_forever, daemon=True)
+    proxy_thread.start()
     server = None
     try:
         subprocess.run(
@@ -1051,7 +1116,8 @@ def run_leader(config: Config, state: State) -> None:
                 print("Another node won the leader election", flush=True)
                 return
             server = subprocess.Popen(
-                vllm_command(settings), env=runtime_environment(settings)
+                vllm_command(inference_settings),
+                env=runtime_environment(inference_settings),
             )
             last_registry_update = 0.0
             while server.poll() is None:
@@ -1067,6 +1133,9 @@ def run_leader(config: Config, state: State) -> None:
     finally:
         stop_process(server)
         stop_ray()
+        public_proxy.shutdown()
+        public_proxy.server_close()
+        proxy_thread.join(timeout=3)
 
 
 def run(config: Config) -> None:

@@ -1,12 +1,17 @@
 import json
+import http.server
+import threading
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
+from urllib.request import urlopen
 
 from lanllm.cluster import (
     allocate_layers,
+    annotate_model_context,
+    ProxyServer,
     elect_leader,
     estimate_fit,
     format_status,
@@ -24,6 +29,56 @@ from lanllm.cluster import (
 
 
 class ElectionTests(unittest.TestCase):
+    def test_model_context_is_advertised_for_runtime_discovery(self) -> None:
+        listing = {
+            "data": [
+                {"id": "active", "max_model_len": 16384},
+                {"id": "other", "meta": {"n_ctx": 4096}},
+            ]
+        }
+        enriched = annotate_model_context(listing)
+        self.assertEqual(enriched["data"][0]["meta"]["n_ctx"], 16384)
+        self.assertEqual(enriched["data"][1]["meta"]["n_ctx"], 4096)
+
+    def test_public_proxy_discovers_context_and_forwards_other_paths(self) -> None:
+        class Upstream(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                body = (
+                    b'{"data":[{"id":"active","max_model_len":16384}]}'
+                    if self.path == "/v1/models" else b"healthy"
+                )
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args) -> None:
+                pass
+
+        upstream = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+        upstream_thread = threading.Thread(target=upstream.serve_forever)
+        upstream_thread.start()
+        proxy = ProxyServer(
+            SimpleNamespace(api_port=0), "127.0.0.1",
+            upstream.server_address[1], annotate_models=True,
+        )
+        proxy_thread = threading.Thread(target=proxy.serve_forever)
+        proxy_thread.start()
+        try:
+            base = f"http://127.0.0.1:{proxy.server_address[1]}"
+            with urlopen(base + "/v1/models", timeout=2) as response:
+                listing = json.load(response)
+            self.assertEqual(listing["data"][0]["meta"]["n_ctx"], 16384)
+            with urlopen(base + "/health", timeout=2) as response:
+                self.assertEqual(response.read(), b"healthy")
+        finally:
+            proxy.shutdown()
+            proxy.server_close()
+            upstream.shutdown()
+            upstream.server_close()
+            proxy_thread.join(timeout=2)
+            upstream_thread.join(timeout=2)
+
     def test_existing_leader_wins_even_when_new_node_has_lower_ip(self) -> None:
         self.assertEqual(
             elect_leader(
