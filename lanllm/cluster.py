@@ -696,6 +696,10 @@ def selected_model_fit(catalog: dict, model_id: str) -> str:
     )
 
 
+def online_gpu_count(nodes: list[dict]) -> int:
+    return sum(len(node["gpus"]) for node in nodes if node["online"])
+
+
 def delete_downloaded_model(
     entry: dict, active_refs: set[str], library_root: Path = Path("/models")
 ) -> int:
@@ -1050,6 +1054,8 @@ def llama_server_command(config: Config, endpoints: list[str]) -> list[str]:
     ]
     if endpoints:
         command += ["--rpc", ",".join(endpoints)]
+    if split := config.env.get("LLAMA_TENSOR_SPLIT", "").strip():
+        command += ["--tensor-split", split]
     return command
 
 
@@ -1207,7 +1213,10 @@ def run_leader(config: Config, state: State) -> None:
             while server.poll() is None:
                 if lower_priority_leader(config) is not None:
                     return
-                registered_nodes(config, state)
+                nodes = registered_nodes(config, state)
+                if not local_only and online_gpu_count(nodes) < target_gpus:
+                    print("GPU pool lost capacity; stopping model", flush=True)
+                    return
                 time.sleep(5)
             raise RuntimeError(f"llama.cpp server exited with code {server.returncode}")
         finally:
@@ -1258,7 +1267,10 @@ def run_leader(config: Config, state: State) -> None:
                     print(f"Another leader won election at {other_leader}", flush=True)
                     return
                 if time.monotonic() - last_registry_update >= 15:
-                    registered_nodes(config, state)
+                    nodes = registered_nodes(config, state)
+                    if not local_only and online_gpu_count(nodes) < target_gpus:
+                        print("GPU pool lost capacity; stopping model", flush=True)
+                        return
                     last_registry_update = time.monotonic()
                 time.sleep(3)
             print(f"vLLM exited with code {server.returncode}; restarting", flush=True)

@@ -71,6 +71,7 @@ def configuration() -> dict[str, str]:
             (models, "token", "HF_TOKEN"),
             (inference, "max_model_len", "MAX_MODEL_LEN"),
             (inference, "llama_parallel", "LLAMA_PARALLEL"),
+            (inference, "llama_tensor_split", "LLAMA_TENSOR_SPLIT"),
             (inference, "gpu_memory_utilization", "GPU_MEMORY_UTILIZATION"),
             (inference, "layer_partition", "LAYER_PARTITION"),
             (inference, "quantization", "QUANTIZATION"),

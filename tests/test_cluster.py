@@ -157,6 +157,15 @@ class ElectionTests(unittest.TestCase):
         self.assertEqual(selected_model_fit(catalog, "large"), "pool")
         self.assertEqual(selected_model_fit(catalog, "missing"), "unknown")
 
+    def test_online_gpu_count_excludes_registered_offline_nodes(self) -> None:
+        from lanllm.cluster import online_gpu_count
+
+        nodes = [
+            {"online": True, "gpus": [{}, {}]},
+            {"online": False, "gpus": [{}]},
+        ]
+        self.assertEqual(online_gpu_count(nodes), 2)
+
     def test_model_context_is_advertised_for_runtime_discovery(self) -> None:
         listing = {
             "data": [
@@ -318,7 +327,7 @@ class StatusTests(unittest.TestCase):
             model_path=Path("/models/gguf/ollama/library/qwen2.5/0.5b/model.gguf"),
             model_id="ollama:qwen2.5:0.5b",
             api_port=8001,
-            env={"LLAMA_RPC_PORT": "50052", "MAX_MODEL_LEN": "2048", "LLAMA_PARALLEL": "2"},
+            env={"LLAMA_RPC_PORT": "50052", "MAX_MODEL_LEN": "2048", "LLAMA_PARALLEL": "2", "LLAMA_TENSOR_SPLIT": "4,4,1"},
         )
         self.assertEqual(llama_rpc_command(config)[-2:], ["--port", "50052"])
         command = llama_server_command(config, ["192.168.2.26:50052"])
@@ -326,6 +335,7 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(command[command.index("--port") + 1], "8001")
         self.assertEqual(command[command.index("--alias") + 1], config.model_id)
         self.assertEqual(command[command.index("--parallel") + 1], "2")
+        self.assertEqual(command[command.index("--tensor-split") + 1], "4,4,1")
         self.assertNotIn("--rpc", llama_server_command(config, []))
 
     def test_json_selection_supersedes_legacy_model(self) -> None:
