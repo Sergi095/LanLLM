@@ -82,6 +82,8 @@ control_port = 8501
 | `inference.max_model_len` | Context limit for llama.cpp and the vLLM fallback. |
 | `inference.llama_parallel` | Concurrent llama.cpp request slots. Default: `1`; each slot needs context memory. |
 | `inference.llama_tensor_split` | Optional llama.cpp GPU weight proportions in device order, such as `"4,4,1"`. Tune when a smaller GPU needs more free memory for prompts. |
+| `inference.llama_cache_type_k`, `inference.llama_cache_type_v` | Optional KV cache formats, such as `"q8_0"`, to reduce context memory. |
+| `inference.llama_batch_size`, `inference.llama_ubatch_size` | Optional llama.cpp prompt batch limits. Smaller values reduce peak GPU memory use. |
 | `inference.gpu_memory_utilization` | GPU memory fraction used for capacity estimates and vLLM. |
 | `inference.layer_partition` | `auto` apportions vLLM layers by GPU memory when the pool is needed. |
 | `api.port` | OpenAI-compatible API on every node. Default: `8001`. |

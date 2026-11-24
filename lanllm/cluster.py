@@ -1056,6 +1056,14 @@ def llama_server_command(config: Config, endpoints: list[str]) -> list[str]:
         command += ["--rpc", ",".join(endpoints)]
     if split := config.env.get("LLAMA_TENSOR_SPLIT", "").strip():
         command += ["--tensor-split", split]
+    for key, flag in (
+        ("LLAMA_CACHE_TYPE_K", "--cache-type-k"),
+        ("LLAMA_CACHE_TYPE_V", "--cache-type-v"),
+        ("LLAMA_BATCH_SIZE", "--batch-size"),
+        ("LLAMA_UBATCH_SIZE", "--ubatch-size"),
+    ):
+        if value := config.env.get(key, "").strip():
+            command += [flag, value]
     return command
 
 

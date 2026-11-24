@@ -327,7 +327,7 @@ class StatusTests(unittest.TestCase):
             model_path=Path("/models/gguf/ollama/library/qwen2.5/0.5b/model.gguf"),
             model_id="ollama:qwen2.5:0.5b",
             api_port=8001,
-            env={"LLAMA_RPC_PORT": "50052", "MAX_MODEL_LEN": "2048", "LLAMA_PARALLEL": "2", "LLAMA_TENSOR_SPLIT": "4,4,1"},
+            env={"LLAMA_RPC_PORT": "50052", "MAX_MODEL_LEN": "2048", "LLAMA_PARALLEL": "2", "LLAMA_TENSOR_SPLIT": "4,4,1", "LLAMA_CACHE_TYPE_K": "q8_0", "LLAMA_CACHE_TYPE_V": "q8_0", "LLAMA_BATCH_SIZE": "512", "LLAMA_UBATCH_SIZE": "128"},
         )
         self.assertEqual(llama_rpc_command(config)[-2:], ["--port", "50052"])
         command = llama_server_command(config, ["192.168.2.26:50052"])
@@ -336,6 +336,8 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(command[command.index("--alias") + 1], config.model_id)
         self.assertEqual(command[command.index("--parallel") + 1], "2")
         self.assertEqual(command[command.index("--tensor-split") + 1], "4,4,1")
+        for flag, value in (("--cache-type-k", "q8_0"), ("--cache-type-v", "q8_0"), ("--batch-size", "512"), ("--ubatch-size", "128")):
+            self.assertEqual(command[command.index(flag) + 1], value)
         self.assertNotIn("--rpc", llama_server_command(config, []))
 
     def test_json_selection_supersedes_legacy_model(self) -> None:
