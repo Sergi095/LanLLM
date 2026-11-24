@@ -14,6 +14,7 @@ from lanllm.cluster import (
     annotate_model_context,
     ControlServer,
     ProxyServer,
+    delete_downloaded_model,
     elect_leader,
     estimate_fit,
     format_status,
@@ -32,6 +33,65 @@ from lanllm.cluster import (
 
 
 class ElectionTests(unittest.TestCase):
+    def test_delete_gguf_removes_only_the_selected_variant(self) -> None:
+        with TemporaryDirectory() as temporary, patch(
+            "lanllm.cluster.DOWNLOAD_JOB", {"status": "idle"}
+        ):
+            root = Path(temporary)
+            folder = root / "gguf/hf/owner/repository"
+            folder.mkdir(parents=True)
+            target = folder / "model.Q6_K.gguf"
+            other = folder / "model.Q8_K.gguf"
+            target.write_bytes(b"q6 weights")
+            other.write_bytes(b"q8 weights")
+            marker = folder / "model.Q6_K.gguf.lanllm-ready"
+            marker.write_text("ready")
+            cache = folder / ".cache/huggingface/download"
+            cache.mkdir(parents=True)
+            metadata = cache / "model.Q6_K.gguf.metadata"
+            metadata.write_text("cached")
+            entry = {
+                "model_id": "hf:owner/repository@model.Q6_K.gguf",
+                "relative_path": "gguf/hf/owner/repository/model.Q6_K.gguf",
+                "backend": "llama.cpp", "source": "hf", "weight_bytes": 10,
+            }
+            with self.assertRaisesRegex(ValueError, "active model"):
+                delete_downloaded_model(entry, {entry["model_id"]}, root)
+            self.assertTrue(target.exists())
+            self.assertEqual(delete_downloaded_model(entry, set(), root), 10)
+            self.assertFalse(target.exists())
+            self.assertFalse(marker.exists())
+            self.assertFalse(metadata.exists())
+            self.assertTrue(other.exists())
+
+    def test_delete_vllm_removes_model_directory(self) -> None:
+        with TemporaryDirectory() as temporary, patch(
+            "lanllm.cluster.DOWNLOAD_JOB", {"status": "idle"}
+        ):
+            root = Path(temporary)
+            folder = root / "models/owner/repository"
+            folder.mkdir(parents=True)
+            (folder / ".lanllm-ready").write_text("ready")
+            (folder / "model.safetensors").write_bytes(b"weights")
+            entry = {
+                "model_id": "owner/repository",
+                "relative_path": "models/owner/repository",
+                "backend": "vllm", "source": "hf", "weight_bytes": 7,
+            }
+            self.assertEqual(delete_downloaded_model(entry, set(), root), 7)
+            self.assertFalse(folder.exists())
+            self.assertFalse(folder.parent.exists())
+
+    def test_delete_rejects_catalog_path_mismatch(self) -> None:
+        with TemporaryDirectory() as temporary:
+            entry = {
+                "model_id": "owner/repository",
+                "relative_path": "models/other/repository",
+                "backend": "vllm", "source": "hf", "weight_bytes": 7,
+            }
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                delete_downloaded_model(entry, set(), Path(temporary))
+
     def test_model_control_requires_worker_only_for_pool_fit(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)

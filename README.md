@@ -125,6 +125,7 @@ command works from any directory after installation.
 | `lanllm top --once` | One dashboard snapshot for scripts. |
 | `lanllm nodes` | Registered nodes, capacities, and online state. |
 | `lanllm models` | Downloaded models with leader and pool fit estimates. |
+| `lanllm delete <ID>` | Remove an unused model from the shared library. |
 | `lanllm logs` | Follow the local container logs. |
 | `lanllm stop` | Stop the local container. |
 
@@ -205,6 +206,19 @@ address. A leader-fit model can start without a worker; a pool-fit model waits
 for all configured GPUs. `lanllm fit owner/repository --apply` combines
 inspection, download, and switch for the recommended variant. A model beyond
 the online capacity is rejected before download.
+
+## Delete a model
+
+Copy the exact reference from `lanllm models` and run the command on any node:
+
+```bash
+lanllm delete 'hf:owner/gguf-repository@model.Q6_K.gguf'
+lanllm delete owner/repository
+```
+
+The leader removes the model's weights and ready marker from the shared
+library. LanLLM refuses to delete the active model; switch to another model
+first. `lanllm model delete <ID>` is an equivalent command.
 
 ## Call the API
 

@@ -306,6 +306,13 @@ def models() -> int:
     return 0
 
 
+def delete_model(model_id: str) -> int:
+    result = post_leader(configuration(), "delete", {"model_id": model_id}, timeout=120)
+    size = result["weight_bytes"] / 2**30
+    print(f"Deleted {result['model_id']} ({size:.1f} GiB of weights) from the shared library")
+    return 0
+
+
 def format_models(data: dict, terminal_width: int) -> str:
     leader_gib = data["leader_usable_mib"] / 1024
     pool_gib = data["registered_usable_mib"] / 1024
@@ -660,6 +667,7 @@ def main() -> int:
             "top",
             "fit",
             "download",
+            "delete",
             "start",
             "stop",
             "logs",
@@ -707,10 +715,14 @@ def main() -> int:
     if args.once:
         parser.error("--once is only accepted with 'top'")
     if args.action == "model":
-        if args.model_id == "switch":
+        if args.model_id in {"switch", "delete"}:
             if not args.switch_model_id:
-                parser.error("use 'lanllm model switch <model ID>'")
-            return model(args.switch_model_id)
+                parser.error(f"use 'lanllm model {args.model_id} <model ID>'")
+            return (
+                model(args.switch_model_id)
+                if args.model_id == "switch"
+                else delete_model(args.switch_model_id)
+            )
         if args.switch_model_id:
             parser.error("use 'lanllm model switch <model ID>'")
         return model(args.model_id)
@@ -718,8 +730,12 @@ def main() -> int:
         if not args.model_id or args.switch_model_id:
             parser.error("use 'lanllm switch <model ID>'")
         return model(args.model_id)
+    if args.action == "delete":
+        if not args.model_id or args.switch_model_id:
+            parser.error("use 'lanllm delete <model ID>'")
+        return delete_model(args.model_id)
     if args.model_id is not None:
-        parser.error("a model ID is only accepted after 'model'")
+        parser.error("a model ID is only accepted after 'model', 'switch', or 'delete'")
     if args.action == "status":
         return status()
     if args.action == "nodes":

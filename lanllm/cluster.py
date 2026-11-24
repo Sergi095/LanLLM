@@ -7,6 +7,7 @@ import http.server
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import socketserver
@@ -36,6 +37,7 @@ MODEL_ID_PATTERN = re.compile(
 )
 REGISTRY_LOCK = threading.Lock()
 DOWNLOAD_LOCK = threading.Lock()
+SELECTION_LOCK = threading.Lock()
 DOWNLOAD_JOB: dict = {"status": "idle"}
 
 
@@ -282,7 +284,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def do_POST(self) -> None:
-        if self.path not in {"/model", "/download", "/fit"}:
+        if self.path not in {"/model", "/download", "/delete", "/fit"}:
             self.send_error(404)
             return
         if self.client_address[0] not in self.server.state.config.peer_ips:
@@ -336,6 +338,31 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 return
             self.reply_json({"status": "started", "ref": spec["ref"]})
             return
+        if self.path == "/delete":
+            try:
+                model_id = data["model_id"]
+                if not isinstance(model_id, str):
+                    raise ValueError("Model reference must be a string")
+                config = self.server.state.config
+                catalog = model_catalog(
+                    config, registered_nodes(config, self.server.state)
+                )
+                matches = [
+                    item for item in catalog["models"] if item["model_id"] == model_id
+                ]
+                if len(matches) != 1:
+                    raise ValueError("Model is not available in the leader's library")
+                with SELECTION_LOCK:
+                    selection = selected_spec(Path("/models"))
+                    active_refs = {config.model_id}
+                    if selection:
+                        active_refs.add(selection["ref"])
+                    freed = delete_downloaded_model(matches[0], active_refs)
+            except (ValueError, KeyError, OSError) as exc:
+                self.reply_json({"error": str(exc)}, status=409)
+                return
+            self.reply_json({"model_id": model_id, "weight_bytes": freed})
+            return
         config = self.server.state.config
         online_gpus = config.local_gpus
         for ip in config.peer_ips:
@@ -387,8 +414,9 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
             Path("/models") / f".lanllm-selection.{os.getpid()}.{threading.get_ident()}"
         )
         try:
-            temporary.write_text(json.dumps(selection) + "\n", encoding="utf-8")
-            temporary.replace(Path("/models/.lanllm-selection.json"))
+            with SELECTION_LOCK:
+                temporary.write_text(json.dumps(selection) + "\n", encoding="utf-8")
+                temporary.replace(Path("/models/.lanllm-selection.json"))
         except OSError as exc:
             self.send_error(503, str(exc))
             return
@@ -668,11 +696,69 @@ def selected_model_fit(catalog: dict, model_id: str) -> str:
     )
 
 
+def delete_downloaded_model(
+    entry: dict, active_refs: set[str], library_root: Path = Path("/models")
+) -> int:
+    """Remove one catalogued model from the leader's shared library."""
+    global DOWNLOAD_JOB
+    ref = entry["model_id"]
+    if ref in active_refs:
+        raise ValueError("Switch to another model before deleting the active model")
+    spec = parse_source(ref)
+    relative = entry["relative_path"]
+    if (
+        spec["relative_path"] != relative
+        or spec["backend"] != entry["backend"]
+    ):
+        raise ValueError("Model catalog path does not match its reference")
+    path = library_root / relative
+    if path.is_symlink() or not path.resolve().is_relative_to(library_root.resolve()):
+        raise ValueError("Model path is outside the shared library")
+    marker = (
+        path / ".lanllm-ready" if entry["backend"] == "vllm"
+        else path.with_name(path.name + ".lanllm-ready")
+    )
+    if not marker.is_file() or not path.exists():
+        raise ValueError("Model files are missing or incomplete")
+    with DOWNLOAD_LOCK:
+        if DOWNLOAD_JOB.get("status") in {"checking", "downloading", "deleting"}:
+            raise ValueError("Wait for the current model library operation to finish")
+        DOWNLOAD_JOB = {"status": "deleting", "ref": ref}
+    try:
+        if entry["backend"] == "vllm":
+            if not path.is_dir():
+                raise ValueError("Model directory is missing")
+            shutil.rmtree(path)
+        else:
+            if not path.is_file():
+                raise ValueError("GGUF model file is missing")
+            path.unlink()
+            marker.unlink()
+            if entry["source"] == "hf":
+                cache = path.parent / ".cache/huggingface/download"
+                for suffix in (".metadata", ".lock"):
+                    (cache / f"{path.name}{suffix}").unlink(missing_ok=True)
+        store_root = library_root / (
+            "models" if entry["backend"] == "vllm" else "gguf"
+        )
+        directory = path.parent
+        while directory != store_root:
+            try:
+                directory.rmdir()
+            except OSError:
+                break
+            directory = directory.parent
+        return int(entry["weight_bytes"])
+    finally:
+        with DOWNLOAD_LOCK:
+            DOWNLOAD_JOB = {"status": "idle"}
+
+
 def start_download(spec: dict, state: State) -> None:
     global DOWNLOAD_JOB
     with DOWNLOAD_LOCK:
-        if DOWNLOAD_JOB.get("status") in {"checking", "downloading"}:
-            raise ValueError("Another model download is already running")
+        if DOWNLOAD_JOB.get("status") in {"checking", "downloading", "deleting"}:
+            raise ValueError("Another model library operation is already running")
         DOWNLOAD_JOB = {
             "status": "checking",
             "stage": "Checking model metadata",
