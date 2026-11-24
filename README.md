@@ -162,7 +162,9 @@ lanllm model switch ollama:qwen2.5:0.5b
 
 `lanllm model switch <ID>` (or the shorter `lanllm switch <ID>`) sends the
 selection to the running leader; both nodes restart
-their inference processes when it changes. vLLM uses Ray pipeline stages;
+their inference processes when it changes. The command waits until the
+selected model appears on both API addresses, or reports a startup timeout.
+vLLM uses Ray pipeline stages;
 llama.cpp exposes each worker's GPUs through its RPC backend on TCP 50052.
 Workers read the leader's model folder over NFS without a local disk copy.
 For a Hugging Face checkpoint, `lanllm model switch <ID>` can also download the model

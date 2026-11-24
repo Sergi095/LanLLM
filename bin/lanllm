@@ -579,8 +579,41 @@ def model(model_id: str | None) -> int:
             "start the missing worker before selecting a model"
         )
     post_leader(values, "model", {"model_id": model_id})
-    print(f"Selected {model_id} on leader {leader['node_ip']}")
+    print(f"Selected {model_id}; waiting for both API addresses to serve it", flush=True)
+    wait_for_model_ready(values, model_id)
+    print(f"Ready: {model_id} on every node")
     return 0
+
+
+def wait_for_model_ready(
+    values: dict[str, str], model_id: str, timeout: int = 600
+) -> None:
+    peers = peer_ips(values)
+    port = int(values.get("API_PORT", "8001"))
+    deadline = time.monotonic() + timeout
+    last_report = 0.0
+    while True:
+        ready = []
+        for ip in peers:
+            try:
+                with urlopen(f"http://{ip}:{port}/v1/models", timeout=3) as response:
+                    listing = json.load(response)
+                if model_id in {item["id"] for item in listing["data"]}:
+                    ready.append(ip)
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+        if len(ready) == len(peers):
+            return
+        now = time.monotonic()
+        if now >= deadline:
+            missing = ", ".join(ip for ip in peers if ip not in ready)
+            raise ValueError(
+                f"Model was not ready within {timeout}s on {missing}; check 'lanllm logs'"
+            )
+        if now - last_report >= 15:
+            print(f"Loading {model_id}: {len(ready)}/{len(peers)} API addresses ready", flush=True)
+            last_report = now
+        time.sleep(2)
 
 
 def main() -> int:

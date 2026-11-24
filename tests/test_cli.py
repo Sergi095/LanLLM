@@ -1,10 +1,28 @@
 import runpy
+import io
+import json
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 
 class ModelSelectionTests(unittest.TestCase):
+    def test_switch_waits_until_both_apis_advertise_selected_model(self) -> None:
+        command = runpy.run_path(str(Path(__file__).parents[1] / "bin/lanllm"))
+        wait = command["wait_for_model_ready"]
+        old = json.dumps({"data": [{"id": "old"}]}).encode()
+        selected = json.dumps({"data": [{"id": "new"}]}).encode()
+        responses = iter([
+            io.BytesIO(old), io.BytesIO(selected),
+            io.BytesIO(selected), io.BytesIO(selected),
+        ])
+        with patch.dict(
+            wait.__globals__,
+            {"urlopen": lambda *_args, **_kwargs: next(responses)},
+        ), patch.object(wait.__globals__["time"], "sleep") as sleep:
+            wait({"PEER_IPS": "192.168.2.33,192.168.2.26"}, "new")
+        sleep.assert_called_once_with(2)
+
     def test_missing_worker_blocks_model_selection(self) -> None:
         command = runpy.run_path(str(Path(__file__).parents[1] / "bin/lanllm"))
         select_model = command["model"]
