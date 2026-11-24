@@ -16,6 +16,7 @@ class Settings:
     local_gpus: int
     total_gpus: int
     model_id: str
+    model_source: str
     ray_port: int
     api_host: str
     api_port: int
@@ -78,6 +79,7 @@ class Settings:
             local_gpus=local_gpus,
             total_gpus=total_gpus,
             model_id=required("MODEL_ID"),
+            model_source=env.get("MODEL_SOURCE", "").strip() or required("MODEL_ID"),
             ray_port=positive("RAY_PORT", "6379"),
             api_host=env.get("API_HOST", "127.0.0.1"),
             api_port=positive("API_PORT", "8000"),
@@ -116,7 +118,7 @@ def vllm_command(settings: Settings) -> list[str]:
     command = [
         "vllm",
         "serve",
-        settings.model_id,
+        settings.model_source,
         "--tensor-parallel-size",
         "1",
         "--pipeline-parallel-size",
@@ -135,10 +137,15 @@ def vllm_command(settings: Settings) -> list[str]:
         settings.attention_backend,
         "--disable-flashinfer-autotune",
     ]
+    if settings.model_source != settings.model_id:
+        command += ["--served-model-name", settings.model_id]
     if settings.enforce_eager:
         command.append("--enforce-eager")
     for flag, value in (
-        ("--revision", settings.hf_revision),
+        (
+            "--revision",
+            settings.hf_revision if settings.model_source == settings.model_id else "",
+        ),
         ("--quantization", settings.quantization),
         ("--dtype", settings.dtype),
     ):

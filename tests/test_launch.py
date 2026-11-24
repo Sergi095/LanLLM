@@ -26,6 +26,26 @@ class LaunchTests(unittest.TestCase):
         )
         self.assertIn("--enforce-eager", command)
 
+    def test_nas_model_keeps_hugging_face_api_name(self) -> None:
+        settings = Settings.from_environment(
+            "head",
+            {
+                "NODE_IP": "192.168.2.33",
+                "HEAD_IP": "192.168.2.33",
+                "NETWORK_INTERFACE": "enp12s0",
+                "LOCAL_GPUS": "2",
+                "TOTAL_GPUS": "3",
+                "MODEL_ID": "Qwen/Qwen2.5-14B-Instruct",
+                "MODEL_SOURCE": "/models/models/Qwen/Qwen2.5-14B-Instruct",
+            },
+        )
+        command = vllm_command(settings)
+        self.assertEqual(command[2], "/models/models/Qwen/Qwen2.5-14B-Instruct")
+        self.assertEqual(
+            command[command.index("--served-model-name") + 1],
+            "Qwen/Qwen2.5-14B-Instruct",
+        )
+
     def test_worker_joins_head_with_one_gpu(self) -> None:
         settings = Settings.from_environment(
             "worker",

@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""Host command for the LanLLM pool; status does not require Docker."""
+
+import argparse
+import os
+import subprocess
+import sys
+from pathlib import Path
+from urllib.parse import urlparse
+
+REPOSITORY = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPOSITORY))
+
+from lanllm.cluster import (  # noqa: E402
+    MODEL_ID_PATTERN,
+    format_status,
+    query_node,
+    selected_model,
+    verify_model_store,
+)
+
+MODEL_STORE = Path.home() / "Escritorio/disk1/LanLLM"
+
+
+def configuration() -> dict[str, str]:
+    values = {}
+    path = REPOSITORY / ".env"
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            key, separator, value = line.partition("=")
+            if separator:
+                values[key.strip()] = value.strip()
+    return values
+
+
+def status() -> int:
+    values = configuration()
+    peers = [ip.strip() for ip in values.get("PEER_IPS", "").split(",") if ip.strip()]
+    if not peers:
+        raise ValueError("PEER_IPS is missing from the LanLLM .env file")
+    port = int(values.get("CONTROL_PORT", "8501"))
+    api_port = int(values.get("API_PORT", "8000"))
+    states = []
+    offline = []
+    for ip in peers:
+        state = query_node(ip, port, timeout=2, full=True)
+        if state is None:
+            offline.append(ip)
+        else:
+            states.append(state)
+    print(format_status(states, offline, api_port))
+    return 0 if states else 1
+
+
+def model(model_id: str | None) -> int:
+    verify_model_store(MODEL_STORE)
+    if model_id is None:
+        print(selected_model(MODEL_STORE) or configuration().get("MODEL_ID", ""))
+        return 0
+    if model_id.startswith("https://"):
+        url = urlparse(model_id)
+        if url.netloc != "huggingface.co" or url.query or url.fragment:
+            raise ValueError("model URL must point to a Hugging Face repository")
+        model_id = url.path.strip("/")
+    if not MODEL_ID_PATTERN.fullmatch(model_id) or ".." in model_id:
+        raise ValueError("model must be a Hugging Face repository ID")
+    temporary = MODEL_STORE / f".lanllm-model.{os.getpid()}"
+    temporary.write_text(model_id + "\n", encoding="utf-8")
+    temporary.replace(MODEL_STORE / ".lanllm-model")
+    print(f"Selected {model_id}; nodes will load it from the shared NAS")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="lanllm")
+    parser.add_argument(
+        "action",
+        nargs="?",
+        default="status",
+        choices=("status", "start", "stop", "logs", "model"),
+    )
+    parser.add_argument("model_id", nargs="?")
+    args = parser.parse_args()
+    if args.action == "model":
+        return model(args.model_id)
+    if args.model_id is not None:
+        parser.error("a model ID is only accepted after 'model'")
+    if args.action == "status":
+        return status()
+    command = {
+        "start": ["docker", "compose", "up", "-d", "--build"],
+        "stop": ["docker", "compose", "down"],
+        "logs": ["docker", "compose", "logs", "-f", "node"],
+    }[args.action]
+    return subprocess.run(
+        command, cwd=REPOSITORY, env=os.environ.copy(), check=False
+    ).returncode
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, ValueError) as exc:
+        print(f"lanllm: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc

@@ -6,6 +6,8 @@ import fcntl
 import http.server
 import json
 import os
+import re
+import signal
 import socket
 import socketserver
 import struct
@@ -16,6 +18,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 
 from lanllm.launch import (
     Settings,
@@ -24,6 +27,22 @@ from lanllm.launch import (
     vllm_command,
     wait_for_gpu_pool,
 )
+
+
+MODEL_ID_PATTERN = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)?\Z"
+)
+
+
+def selected_model(root: Path = Path("/models")) -> str | None:
+    selection = root / ".lanllm-model"
+    try:
+        model_id = selection.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    if not MODEL_ID_PATTERN.fullmatch(model_id) or ".." in model_id:
+        raise ValueError(f"Invalid model ID in {selection}: {model_id!r}")
+    return model_id
 
 
 def local_ip_for(peer_ip: str) -> str:
@@ -87,6 +106,10 @@ class Config:
     control_port: int
     env: dict[str, str]
 
+    @property
+    def model_path(self) -> Path:
+        return Path("/models/models") / self.model_id
+
     @classmethod
     def from_environment(cls, env: dict[str, str]) -> "Config":
         peers = tuple(
@@ -109,9 +132,11 @@ class Config:
         total_gpus = int(env.get("TOTAL_GPUS", "3"))
         if total_gpus < local_gpus:
             raise ValueError("TOTAL_GPUS is less than this node's GPU count")
-        model_id = env.get("MODEL_ID", "").strip()
+        model_id = selected_model() or env.get("MODEL_ID", "").strip()
         if not model_id:
             raise ValueError("MODEL_ID must be set")
+        if not MODEL_ID_PATTERN.fullmatch(model_id) or ".." in model_id:
+            raise ValueError("MODEL_ID must be a Hugging Face model ID")
         return cls(
             node_ip=node_ip,
             peer_ips=peers,
@@ -130,6 +155,7 @@ class Config:
         values.update(
             NODE_IP=self.node_ip,
             HEAD_IP=leader_ip,
+            MODEL_ID=self.model_id,
             NETWORK_INTERFACE=self.network_interface,
             LOCAL_GPUS=str(self.local_gpus),
             TOTAL_GPUS=str(self.total_gpus),
@@ -137,6 +163,7 @@ class Config:
             API_PORT=str(self.api_port),
             RAY_PORT=str(self.ray_port),
             LAYER_PARTITION=partition,
+            MODEL_SOURCE=str(self.model_path),
         )
         return Settings.from_environment(role, values)
 
@@ -263,15 +290,7 @@ def resolve_partition(config: Config, leader_ip: str) -> str:
                 break
         print("Waiting for GPU inventory to calculate layer partition", flush=True)
         time.sleep(5)
-    from huggingface_hub import hf_hub_download
-
-    path = hf_hub_download(
-        repo_id=config.model_id,
-        filename="config.json",
-        revision=config.env.get("HF_REVISION") or None,
-        token=config.env.get("HF_TOKEN") or None,
-    )
-    with open(path, encoding="utf-8") as source:
+    with open(config.model_path / "config.json", encoding="utf-8") as source:
         model_config = json.load(source)
     layer_count = model_config.get("num_hidden_layers")
     if not isinstance(layer_count, int):
@@ -281,6 +300,67 @@ def resolve_partition(config: Config, leader_ip: str) -> str:
     partition = ",".join(str(count) for count in allocate_layers(layer_count, memory))
     print(f"Auto layer partition: {partition} for GPUs {memory} MiB", flush=True)
     return partition
+
+
+def verify_model_store(root: Path = Path("/models")) -> None:
+    marker = root / ".lanllm-store"
+    try:
+        valid = marker.read_text(encoding="ascii").strip() == "lanllm-model-store-v1"
+    except OSError:
+        valid = False
+    if not valid:
+        raise ValueError(
+            f"The shared NAS model store is not mounted at {root}; "
+            "check the Storage1 mount on this host"
+        )
+
+
+def model_ready(config: Config) -> bool:
+    revision = config.env.get("HF_REVISION", "").strip() or "main"
+    try:
+        return (config.model_path / "config.json").is_file() and (
+            config.model_path / ".lanllm-ready"
+        ).read_text().strip() == revision
+    except OSError:
+        return False
+
+
+def ensure_model(config: Config) -> None:
+    if model_ready(config):
+        print(f"Using shared NAS model at {config.model_path}", flush=True)
+        return
+    from huggingface_hub import snapshot_download
+
+    config.model_path.mkdir(parents=True, exist_ok=True)
+    print(f"Downloading {config.model_id} once to {config.model_path}", flush=True)
+    snapshot_download(
+        repo_id=config.model_id,
+        local_dir=config.model_path,
+        revision=config.env.get("HF_REVISION") or None,
+        token=config.env.get("HF_TOKEN") or None,
+    )
+    if not (config.model_path / "config.json").is_file():
+        raise RuntimeError("The NAS model download has no config.json")
+    revision = config.env.get("HF_REVISION", "").strip() or "main"
+    temporary = config.model_path / f".lanllm-ready.{os.getpid()}"
+    temporary.write_text(revision + "\n", encoding="ascii")
+    temporary.replace(config.model_path / ".lanllm-ready")
+    print(f"Shared NAS model ready: {config.model_path}", flush=True)
+
+
+def wait_for_model(config: Config, leader_ip: str) -> bool:
+    failures = 0
+    while not model_ready(config):
+        leader = query_node(leader_ip, config.control_port)
+        if leader is None or leader.get("role") != "leader":
+            failures += 1
+            if failures >= 3:
+                return False
+        else:
+            failures = 0
+        print(f"Waiting for shared NAS model {config.model_id}", flush=True)
+        time.sleep(5)
+    return True
 
 
 class ProxyHandler(socketserver.BaseRequestHandler):
@@ -365,15 +445,17 @@ def lower_priority_leader(config: Config) -> str | None:
 
 def run_worker(config: Config, state: State, leader_ip: str) -> None:
     state.set("worker", leader_ip)
-    settings = config.settings(
-        "worker", leader_ip, resolve_partition(config, leader_ip)
-    )
     proxy = ProxyServer(config, leader_ip)
     proxy_thread = threading.Thread(target=proxy.serve_forever, daemon=True)
     proxy_thread.start()
     process = None
     failures = 0
     try:
+        if not wait_for_model(config, leader_ip):
+            return
+        settings = config.settings(
+            "worker", leader_ip, resolve_partition(config, leader_ip)
+        )
         while True:
             leader = query_node(leader_ip, config.control_port)
             if leader is None or leader.get("role") != "leader":
@@ -403,6 +485,9 @@ def run_worker(config: Config, state: State, leader_ip: str) -> None:
 
 def run_leader(config: Config, state: State) -> None:
     state.set("leader", config.node_ip)
+    if lower_priority_leader(config) is not None:
+        return
+    ensure_model(config)
     settings = config.settings(
         "head", config.node_ip, resolve_partition(config, config.node_ip)
     )
@@ -439,10 +524,28 @@ def run_leader(config: Config, state: State) -> None:
 
 
 def run(config: Config) -> None:
+    verify_model_store()
     state = State(config)
     control = ControlServer(state)
     control_thread = threading.Thread(target=control.serve_forever, daemon=True)
     control_thread.start()
+
+    def watch_selection() -> None:
+        while True:
+            time.sleep(2)
+            try:
+                changed = selected_model() not in (None, config.model_id)
+            except (OSError, ValueError) as exc:
+                print(f"Model selection error: {exc}", flush=True)
+                continue
+            if changed:
+                print(
+                    "Shared model selection changed; restarting this node", flush=True
+                )
+                os.kill(os.getpid(), signal.SIGUSR1)
+                return
+
+    threading.Thread(target=watch_selection, daemon=True).start()
     print(
         f"LanLLM node {config.node_ip} ({config.network_interface}), "
         f"{config.local_gpus} local GPU(s)",
@@ -474,9 +577,8 @@ def format_status(states: list[dict], offline: list[str], api_port: int) -> str:
     lines = ["LanLLM GPU pool", "=" * 109]
     if states:
         leaders = [state["node_ip"] for state in states if state["role"] == "leader"]
-        lines.append(
-            f"Model: {states[0]['model_id']}   Leader: {leaders[0] if leaders else 'starting'}"
-        )
+        leader = leaders[0] if leaders else "starting"
+        lines.append(f"Model: {states[0]['model_id']}   Leader: {leader}")
     lines.append(
         f"{'Node / role':<25} {'GPU':<3} {'Name':<36} {'Temp':>5} "
         f"{'Util':>5} {'VRAM used / total':>21} {'Power':>8}"
@@ -533,6 +635,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.action == "status":
         status(config)
     else:
+        signal.signal(signal.SIGUSR1, lambda _signum, _frame: sys.exit(42))
         run(config)
     return 0
 

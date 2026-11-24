@@ -8,7 +8,8 @@ Both hosts run the same Docker image, Compose service, and commands. A node
 finds its own LAN address, network interface, and GPU count. If another node
 is already leading, it joins that Ray cluster; otherwise the first available
 node starts a cluster. The leader runs vLLM, and other nodes forward API
-traffic to it. The model uses pipeline stages across all three GPUs.
+traffic to it. The model uses pipeline stages across all three GPUs. Both
+nodes read the same model directory on `storage.robin/Storage1`.
 
 The model ID can be any Hugging Face model with an architecture and weight
 format supported by vLLM, provided its weights and KV cache fit the GPUs.
@@ -27,32 +28,40 @@ specification. The current hosts are configured. On a new host, generate
 --output=/etc/cdi/nvidia.yaml`, then check access with `docker run --rm
 --device nvidia.com/gpu=all ubuntu:24.04 nvidia-smi -L`.
 
-Put this repository on each host. On **each** host, run the same commands:
+Mount `//storage.robin/Storage1` at `~/Escritorio/disk1` on both hosts before
+starting. The existing `/etc/fstab` entries mount it at boot; Katana also has
+an `/etc/hosts` entry for `storage.robin`. The Compose bind mount requires
+`~/Escritorio/disk1/LanLLM` to exist, and the container checks a marker on
+the share so an unmounted NAS cannot silently create a local model copy.
+
+Put this repository on each host. Install the host command once on each:
 
 ```bash
 cd ~/repos/LanLLM
-cp .env.example .env
-docker compose up -d --build
+sudo ln -s "$PWD/bin/lanllm" /usr/local/bin/lanllm
 ```
+
+Then run these same commands from **any directory** on either host:
+
+```bash
+lanllm start
+lanllm
+```
+
+`lanllm` (or `lanllm status`) prints a combined GPU table directly from the
+host, without Docker. `lanllm logs` follows startup logs; `lanllm stop`
+stops the local node.
 
 `PEER_IPS` in `.env` lists every node. Set the same `MODEL_ID` and
 `TOTAL_GPUS` on all nodes. The first node can start alone; it waits for the
 other GPU inventory and the requested GPU count before serving. Start the
 second node whenever ready. If the leader stops, a remaining node can become
 leader when the former leader's control endpoint becomes unreachable. The API
-is ready again after the
-requested GPU count rejoins and the model loads.
+is ready again after the requested GPU count rejoins and the model loads.
 
-On either host, inspect the pool with a display similar to `nvidia-smi`:
-
-```bash
-docker compose exec node python3 -m lanllm status
-```
-
-This shows the GPU name, temperature, utilization, VRAM usage, power, and
+The table shows the GPU name, temperature, utilization, VRAM usage, power, and
 CPU/RAM summary for every reachable node. `nvidia-smi` still shows only the
-physical GPUs on the host where it runs. For startup logs use
-`docker compose logs -f node`.
+physical GPUs on the host where it runs.
 
 The OpenAI-compatible API is available on **both** LAN addresses:
 
@@ -71,9 +80,21 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 ## Use another model
 
-Set `MODEL_ID` to the Hugging Face repository ID in `.env` on both hosts,
-then run `docker compose up -d --force-recreate` on both hosts. Model files
-are cached under each host's `~/.cache/huggingface` and survive restarts.
+Run `lanllm model <Hugging-Face-repository-ID>` on either host. For example:
+
+```bash
+lanllm model Qwen/Qwen2.5-14B-Instruct
+```
+
+A `https://huggingface.co/<owner>/<model>` URL works too.
+
+The selection is stored on Storage1 and shared by every node. Running nodes
+restart themselves when it changes. The elected leader downloads a missing
+model once to `Storage1/LanLLM/models/<MODEL_ID>`; all nodes load it from that
+directory. Hugging Face metadata also stays on the NAS. The local vLLM cache
+stores compiled kernels, not model weights. Run `lanllm model` without an ID
+to show the selected model. `MODEL_ID` in `.env` is the initial default before
+a shared selection is made.
 For a gated model, set `HF_TOKEN` in both `.env` files.
 
 Optional settings include `HF_REVISION`, `QUANTIZATION`, `DTYPE`,
@@ -90,7 +111,7 @@ API gateway on networks you do not trust. Ray and the leader election use
 host networking. The nodes need TCP access to one another, including Ray's
 dynamic worker ports.
 
-Stop with `docker compose down` on both hosts.
+Stop with `lanllm stop` on both hosts.
 
 LanLLM uses [vLLM's official container image](https://docs.vllm.ai/en/latest/deployment/docker/)
 and Ray's [on-premise cluster approach](https://docs.ray.io/en/latest/cluster/vms/user-guides/launching-clusters/on-premises.html).

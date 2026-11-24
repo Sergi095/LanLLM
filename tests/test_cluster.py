@@ -1,6 +1,14 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
-from lanllm.cluster import allocate_layers, elect_leader, format_status
+from lanllm.cluster import (
+    allocate_layers,
+    elect_leader,
+    format_status,
+    selected_model,
+    verify_model_store,
+)
 
 
 class ElectionTests(unittest.TestCase):
@@ -62,6 +70,24 @@ class StatusTests(unittest.TestCase):
         self.assertIn("Model: Qwen/Qwen2.5-14B-Instruct", output)
         self.assertIn("5,000 / 16,303 MiB VRAM used", output)
         self.assertIn("192.168.2.26: offline", output)
+
+    def test_unmounted_store_is_rejected(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = Path(directory)
+            with self.assertRaisesRegex(ValueError, "shared NAS model store"):
+                verify_model_store(store)
+            (store / ".lanllm-store").write_text("lanllm-model-store-v1\n")
+            verify_model_store(store)
+
+    def test_shared_model_selection_rejects_invalid_ids(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = Path(directory)
+            self.assertIsNone(selected_model(store))
+            (store / ".lanllm-model").write_text("Qwen/Qwen2.5-14B-Instruct\n")
+            self.assertEqual(selected_model(store), "Qwen/Qwen2.5-14B-Instruct")
+            (store / ".lanllm-model").write_text("../other")
+            with self.assertRaisesRegex(ValueError, "Invalid model ID"):
+                selected_model(store)
 
 
 if __name__ == "__main__":

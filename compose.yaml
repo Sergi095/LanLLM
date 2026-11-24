@@ -25,6 +25,7 @@ services:
       ATTENTION_BACKEND: ${ATTENTION_BACKEND:-FLASH_ATTN}
       ENFORCE_EAGER: ${ENFORCE_EAGER:-1}
       HF_TOKEN: ${HF_TOKEN:-}
+      HF_HOME: /models/.hf-cache
       HF_REVISION: ${HF_REVISION:-}
       QUANTIZATION: ${QUANTIZATION:-}
       DTYPE: ${DTYPE:-}
@@ -32,5 +33,9 @@ services:
       TRUST_REMOTE_CODE: ${TRUST_REMOTE_CODE:-0}
       POOL_WAIT_TIMEOUT: ${POOL_WAIT_TIMEOUT:-600}
     volumes:
-      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+      - type: bind
+        source: ${HOME}/Escritorio/disk1/LanLLM
+        target: /models
+        bind:
+          create_host_path: false
       - ${HOME}/.cache/vllm:/root/.cache/vllm
