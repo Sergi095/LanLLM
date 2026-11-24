@@ -70,6 +70,7 @@ def configuration() -> dict[str, str]:
             (models, "revision", "HF_REVISION"),
             (models, "token", "HF_TOKEN"),
             (inference, "max_model_len", "MAX_MODEL_LEN"),
+            (inference, "llama_parallel", "LLAMA_PARALLEL"),
             (inference, "gpu_memory_utilization", "GPU_MEMORY_UTILIZATION"),
             (inference, "layer_partition", "LAYER_PARTITION"),
             (inference, "quantization", "QUANTIZATION"),

@@ -1043,6 +1043,8 @@ def llama_server_command(config: Config, endpoints: list[str]) -> list[str]:
         config.model_id,
         "--ctx-size",
         config.env.get("MAX_MODEL_LEN", "2048"),
+        "--parallel",
+        config.env.get("LLAMA_PARALLEL", "1"),
         "--n-gpu-layers",
         "all",
     ]

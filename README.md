@@ -64,6 +64,7 @@ default_id = "owner/repository"
 
 [inference]
 max_model_len = 8192
+llama_parallel = 1
 gpu_memory_utilization = 0.9
 layer_partition = "auto"
 
@@ -79,6 +80,7 @@ control_port = 8501
 | `models.directory` | Local folder created and exported when this node leads. It may differ by node. |
 | `models.default_id` | Initial Hugging Face model before a selection is saved. |
 | `inference.max_model_len` | Context limit for llama.cpp and the vLLM fallback. |
+| `inference.llama_parallel` | Concurrent llama.cpp request slots. Default: `1`; each slot needs context memory. |
 | `inference.gpu_memory_utilization` | GPU memory fraction used for capacity estimates and vLLM. |
 | `inference.layer_partition` | `auto` apportions vLLM layers by GPU memory when the pool is needed. |
 | `api.port` | OpenAI-compatible API on every node. Default: `8001`. |
