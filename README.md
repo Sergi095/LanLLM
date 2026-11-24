@@ -230,13 +230,43 @@ http://<node-b-lan-ip>:8001/v1
 ```
 
 The active model and its context limit are available at `/v1/models`. The
-response includes `max_model_len` and `meta.n_ctx` for clients that discover
-local model limits. Tool definitions and system prompts count toward that
-limit.
+response exposes the allocated context as `meta.n_ctx` for clients that
+discover local model limits. Tool definitions and system prompts count toward
+that limit.
 
 ```bash
 curl http://<node-lan-ip>:8001/v1/models
 ```
+
+### Goose model discovery
+
+Use a custom OpenAI-compatible provider with dynamic models and no fixed
+`context_limit` entries:
+
+```json
+{
+  "name": "custom_lanllm",
+  "engine": "openai",
+  "display_name": "LanLLM",
+  "api_key_env": "",
+  "base_url": "http://192.0.2.10:8001",
+  "base_path": "/v1/chat/completions",
+  "models": [],
+  "dynamic_models": true,
+  "skip_canonical_filtering": true,
+  "supports_streaming": true,
+  "requires_auth": false
+}
+```
+
+Replace the documentation address with either node's LAN address. Goose can
+discover the active model and its `meta.n_ctx` from `/v1/models`. An explicit
+`models[].context_limit` or `GOOSE_CONTEXT_LIMIT` overrides discovery. Start a
+new Goose session after changing providers or switching models so cached model
+information is refreshed. Context discovery reports the server allocation; to
+increase it, change `inference.max_model_len` and restart LanLLM. The new size
+must still fit the GPUs. See [Goose's context resolution
+guidance](https://github.com/aaif-goose/goose/issues/10966).
 
 Only one service can bind the configured API port on a host. Change `api.port`
 on every node if another process already uses it.
