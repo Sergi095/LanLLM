@@ -15,6 +15,7 @@ services:
     environment:
       PEER_IPS: ${PEER_IPS:?List all LAN node IPs in .env}
       MODEL_ID: ${MODEL_ID:?Set a Hugging Face model ID in .env}
+      MODEL_PROFILES_JSON: ${MODEL_PROFILES_JSON:-{}}
       MODEL_STORE_DIR: ${MODEL_STORE_DIR:-/srv/lanllm-store}
       TOTAL_GPUS: ${TOTAL_GPUS:-3}
       NODE_IP: ${NODE_IP:-}

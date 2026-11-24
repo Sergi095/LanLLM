@@ -13,6 +13,8 @@ from lanllm.cluster import (
     llama_rpc_command,
     llama_server_command,
     model_catalog,
+    model_layer_count,
+    resolve_partition,
     mount_model_store,
     registered_nodes,
     selected_model,
@@ -79,6 +81,21 @@ class ElectionTests(unittest.TestCase):
     def test_uneven_vram_gets_uneven_layers_in_either_rank_order(self) -> None:
         self.assertEqual(allocate_layers(48, [8188, 16303, 16376]), [8, 20, 20])
         self.assertEqual(allocate_layers(48, [16303, 16376, 8188]), [20, 20, 8])
+
+    def test_multimodal_text_layers_are_used_for_partition(self) -> None:
+        self.assertEqual(model_layer_count({"text_config": {"num_hidden_layers": 64}}), 64)
+
+    def test_model_profile_can_override_auto_partition(self) -> None:
+        config = SimpleNamespace(
+            model_id="owner/repository",
+            env={
+                "LAYER_PARTITION": "auto",
+                "MODEL_PROFILES_JSON": json.dumps({
+                    "owner/repository": {"layer_partition": "29,29,6"}
+                }),
+            },
+        )
+        self.assertEqual(resolve_partition(config, "192.168.1.10"), "29,29,6")
 
 
 class StatusTests(unittest.TestCase):

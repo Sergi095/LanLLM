@@ -1,16 +1,23 @@
 # Copy this file to lanllm.conf on every node. Paths may differ by node.
 
 [cluster]
-peers = ["192.168.2.33", "192.168.2.26"]
+peers = ["192.168.1.10", "192.168.1.11"]
 total_gpus = 3
 
 [models]
-# LanLLM creates and exports its own folder. Kratos can override this with
-# /disks/sata1/lanllm; Katana can keep this default.
+# LanLLM creates and exports this folder. Set a local path on each node.
 directory = "/srv/lanllm-store"
 default_id = "Qwen/Qwen2.5-14B-Instruct"
 # revision = "main"
 # token = "hf_..."  # Or set HF_TOKEN in .env instead.
+
+# Optional vLLM settings for the selected model.
+[models.profiles."Qwen/Qwen2.5-14B-Instruct"]
+tool_call_parser = "hermes"
+# Add [models.profiles."owner/repository"] tables for other models.
+# Supported keys include served_model_names, tool_call_parser, reasoning_parser,
+# tokenizer, dtype, max_model_len, layer_partition, cpu_offload_gb,
+# max_num_seqs, max_num_batched_tokens, and gdn_prefill_backend.
 
 [inference]
 max_model_len = 2048

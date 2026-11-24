@@ -434,7 +434,9 @@ def allocate_layers(layer_count: int, memory_mib: list[int]) -> list[int]:
 
 
 def resolve_partition(config: Config, leader_ip: str) -> str:
-    requested = config.env.get("LAYER_PARTITION", "").strip()
+    profiles = json.loads(config.env.get("MODEL_PROFILES_JSON", "{}"))
+    profile = profiles.get(config.model_id, {})
+    requested = str(profile.get("layer_partition") or config.env.get("LAYER_PARTITION", "")).strip()
     if requested != "auto":
         return requested
     ordered_ips = [leader_ip] + [ip for ip in config.peer_ips if ip != leader_ip]
@@ -450,7 +452,7 @@ def resolve_partition(config: Config, leader_ip: str) -> str:
         time.sleep(5)
     with open(config.model_path / "config.json", encoding="utf-8") as source:
         model_config = json.load(source)
-    layer_count = model_config.get("num_hidden_layers")
+    layer_count = model_layer_count(model_config)
     if not isinstance(layer_count, int):
         raise ValueError(
             "Auto layer partition requires num_hidden_layers in config.json"
@@ -458,6 +460,13 @@ def resolve_partition(config: Config, leader_ip: str) -> str:
     partition = ",".join(str(count) for count in allocate_layers(layer_count, memory))
     print(f"Auto layer partition: {partition} for GPUs {memory} MiB", flush=True)
     return partition
+
+
+def model_layer_count(model_config: dict) -> int | None:
+    count = model_config.get("num_hidden_layers")
+    if count is None and isinstance(model_config.get("text_config"), dict):
+        count = model_config["text_config"].get("num_hidden_layers")
+    return count if isinstance(count, int) and not isinstance(count, bool) else None
 
 
 def verify_model_store(root: Path = Path("/models")) -> None:

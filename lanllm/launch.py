@@ -1,6 +1,7 @@
 """Start a Ray GPU pool and serve any model supported by vLLM."""
 
 import os
+import json
 import re
 import time
 from dataclasses import dataclass
@@ -30,6 +31,15 @@ class Settings:
     layer_partition: str
     trust_remote_code: bool
     pool_wait_timeout: int
+    served_model_names: tuple[str, ...] = ()
+    tool_call_parser: str = ""
+    reasoning_parser: str = ""
+    tokenizer: str = ""
+    kv_cache_dtype: str = ""
+    cpu_offload_gb: float = 0
+    max_num_seqs: int = 0
+    max_num_batched_tokens: int = 0
+    gdn_prefill_backend: str = ""
 
     @classmethod
     def from_environment(
@@ -71,6 +81,17 @@ class Settings:
             if len(layers) != total_gpus or any(layer < 1 for layer in layers):
                 raise ValueError("LAYER_PARTITION needs one positive count per GPU")
 
+        model_id = required("MODEL_ID")
+        profiles = json.loads(env.get("MODEL_PROFILES_JSON", "{}"))
+        if not isinstance(profiles, dict):
+            raise ValueError("models.profiles must be a table")
+        profile = profiles.get(model_id, {})
+        if not isinstance(profile, dict):
+            raise ValueError(f"Profile for {model_id} must be a table")
+        names = profile.get("served_model_names", [])
+        if not isinstance(names, list) or not all(isinstance(name, str) and name for name in names):
+            raise ValueError("served_model_names must be a list of nonempty strings")
+
         return cls(
             role=role,
             node_ip=node_ip,
@@ -78,21 +99,30 @@ class Settings:
             network_interface=network_interface,
             local_gpus=local_gpus,
             total_gpus=total_gpus,
-            model_id=required("MODEL_ID"),
-            model_source=env.get("MODEL_SOURCE", "").strip() or required("MODEL_ID"),
+            model_id=model_id,
+            model_source=env.get("MODEL_SOURCE", "").strip() or model_id,
             ray_port=positive("RAY_PORT", "6379"),
             api_host=env.get("API_HOST", "127.0.0.1"),
             api_port=positive("API_PORT", "8001"),
-            max_model_len=positive("MAX_MODEL_LEN", "1024"),
+            max_model_len=int(profile.get("max_model_len") or positive("MAX_MODEL_LEN", "1024")),
             gpu_memory_utilization=utilization,
             attention_backend=env.get("ATTENTION_BACKEND", "FLASH_ATTN"),
             enforce_eager=env.get("ENFORCE_EAGER", "1") == "1",
             hf_revision=env.get("HF_REVISION", ""),
             quantization=env.get("QUANTIZATION", ""),
-            dtype=env.get("DTYPE", ""),
+            dtype=str(profile.get("dtype") or env.get("DTYPE", "")),
             layer_partition=partition,
-            trust_remote_code=env.get("TRUST_REMOTE_CODE", "0") == "1",
+            trust_remote_code=bool(profile.get("trust_remote_code", env.get("TRUST_REMOTE_CODE", "0") == "1")),
             pool_wait_timeout=positive("POOL_WAIT_TIMEOUT", "600"),
+            served_model_names=tuple(dict.fromkeys([*names, model_id])),
+            tool_call_parser=str(profile.get("tool_call_parser", "")),
+            reasoning_parser=str(profile.get("reasoning_parser", "")),
+            tokenizer=str(profile.get("tokenizer", "")),
+            kv_cache_dtype=str(profile.get("kv_cache_dtype", "")),
+            cpu_offload_gb=float(profile.get("cpu_offload_gb", 0)),
+            max_num_seqs=int(profile.get("max_num_seqs", 0)),
+            max_num_batched_tokens=int(profile.get("max_num_batched_tokens", 0)),
+            gdn_prefill_backend=str(profile.get("gdn_prefill_backend", "")),
         )
 
 
@@ -136,9 +166,11 @@ def vllm_command(settings: Settings) -> list[str]:
         "--attention-backend",
         settings.attention_backend,
         "--disable-flashinfer-autotune",
+        "--safetensors-load-strategy",
+        "lazy",
     ]
-    if settings.model_source != settings.model_id:
-        command += ["--served-model-name", settings.model_id]
+    if settings.model_source != settings.model_id or len(settings.served_model_names) > 1:
+        command += ["--served-model-name", *(settings.served_model_names or (settings.model_id,))]
     if settings.enforce_eager:
         command.append("--enforce-eager")
     for flag, value in (
@@ -148,11 +180,25 @@ def vllm_command(settings: Settings) -> list[str]:
         ),
         ("--quantization", settings.quantization),
         ("--dtype", settings.dtype),
+        ("--tool-call-parser", settings.tool_call_parser),
+        ("--reasoning-parser", settings.reasoning_parser),
+        ("--tokenizer", settings.tokenizer),
+        ("--kv-cache-dtype", settings.kv_cache_dtype),
     ):
         if value:
             command += [flag, value]
     if settings.trust_remote_code:
         command.append("--trust-remote-code")
+    if settings.tool_call_parser:
+        command.append("--enable-auto-tool-choice")
+    if settings.cpu_offload_gb:
+        command += ["--cpu-offload-gb", str(settings.cpu_offload_gb)]
+    if settings.max_num_seqs:
+        command += ["--max-num-seqs", str(settings.max_num_seqs)]
+    if settings.max_num_batched_tokens:
+        command += ["--max-num-batched-tokens", str(settings.max_num_batched_tokens)]
+    if settings.gdn_prefill_backend:
+        command += ["--additional-config", json.dumps({"gdn_prefill_backend": settings.gdn_prefill_backend})]
     return command
 
 

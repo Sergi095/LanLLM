@@ -3,8 +3,6 @@
 Run Hugging Face and Ollama library models across NVIDIA GPUs on computers in
 one LAN. vLLM serves Hugging Face checkpoints; llama.cpp serves GGUF files from
 Hugging Face or the Ollama library.
-The current two hosts pool an RTX 5070 Ti and RTX A4000 at `192.168.2.33`
-with Katana's RTX 4070 Laptop GPU at `192.168.2.26`.
 
 Both hosts run the same Docker image, Compose service, and commands. A node
 finds its own LAN address, network interface, and GPU count. If another node
@@ -16,16 +14,14 @@ worker mounts the leader's model folder over NFS using the elected leader IP.
 The model ID can be any Hugging Face model with an architecture and weight
 format supported by vLLM, provided its weights and KV cache fit the GPUs.
 GPU VRAM is distributed across stages, not exposed as one contiguous block.
-Katana has 8 GB, so larger models may need quantization or an uneven layer
-partition. The current default, [Qwen2.5 14B Instruct](https://huggingface.co/Qwen/Qwen2.5-14B-Instruct), has about
-30 GB of weights and 48 transformer layers. Auto partitioning assigns 8
-layers to the 8 GB GPU and 20 to each 16 GB GPU, in whichever pipeline order
-the leader creates.
+Models may need quantization or an uneven layer partition when GPUs have
+different VRAM capacities. Automatic partitioning assigns layers according to
+the available VRAM on each GPU.
 
 ## Start on either host
 
-Both hosts need Docker, the NVIDIA Container Toolkit, and a CDI GPU
-specification. The current hosts are configured. On a new host, generate
+Each host needs Docker, the NVIDIA Container Toolkit, and a CDI GPU
+specification. Generate
 `/etc/cdi/nvidia.yaml` with `sudo nvidia-ctk cdi generate
 --output=/etc/cdi/nvidia.yaml`, then check access with `docker run --rm
 --device nvidia.com/gpu=all ubuntu:24.04 nvidia-smi -L`.
@@ -34,7 +30,7 @@ specification. The current hosts are configured. On a new host, generate
 needed. It uses the local model folder from `lanllm.conf` and exports it
 read-only to the other listed nodes. Each container mounts the elected
 leader's store at `/models`. The leader reads its local disk; workers read
-that same folder over the LAN. No separate NAS is needed. The containers need
+that same folder over the LAN. The containers need
 privileged mode to mount NFS inside their own mount namespaces.
 
 Put this repository on each host. Install the host command once on each:
@@ -48,10 +44,8 @@ sudo ln -s "$PWD/bin/lanllm" /usr/local/bin/lanllm
 Edit `lanllm.conf` to choose `models.directory`, the default Hugging Face
 model, peer IPs, GPU count, inference settings, and API port. The directory
 is local to each host; it can differ between hosts. The default is
-`/srv/lanllm-store`; Kratos overrides it with
-`/disks/sata1/lanllm`, a dedicated folder on the same SATA1 disk
-used by `repos/vllm`. Katana keeps the default. LanLLM creates and shares only
-its own folder; files already in `repos/vllm` remain separate. New downloads
+`/srv/lanllm-store`. LanLLM creates and shares only
+its own folder. New downloads
 go into its `models/` and `gguf/` subfolders. Keep `.env` for optional secrets
 or settings absent from the TOML file; values in `lanllm.conf` take precedence.
 
@@ -93,13 +87,12 @@ physical GPUs on the host where it runs.
 The OpenAI-compatible API is available on **both** LAN addresses:
 
 ```text
-http://192.168.2.33:8001/v1
-http://192.168.2.26:8001/v1
+http://<node-a-lan-ip>:8001/v1
+http://<node-b-lan-ip>:8001/v1
 ```
 
-Port 8001 matches the inference containers in `repos/vllm`. Its Ollama
-embedding service uses 11433 separately. Only one inference server can bind
-port 8001 on a host at a time.
+Only one inference server can bind port 8001 on a host at a time. Change
+`api.port` on every node if another service uses it.
 
 For example, run this on either host:
 
@@ -137,21 +130,39 @@ Downloading does not interrupt the running model. To serve a downloaded model,
 copy its reference from `lanllm models` or the download completion message:
 
 ```bash
-lanllm model Qwen/Qwen2.5-14B-Instruct
-lanllm model ollama:qwen2.5:0.5b
+lanllm model switch Qwen/Qwen2.5-14B-Instruct
+lanllm model switch ollama:qwen2.5:0.5b
 ```
 
-`lanllm model` sends the selection to the running leader; both nodes restart
+`lanllm model switch <ID>` (or the shorter `lanllm switch <ID>`) sends the
+selection to the running leader; both nodes restart
 their inference processes when it changes. vLLM uses Ray pipeline stages;
 llama.cpp exposes each worker's GPUs through its RPC backend on TCP 50052.
 Workers read the leader's model folder over NFS without a local disk copy.
-For a Hugging Face checkpoint, `lanllm model <ID>` can also download the model
+For a Hugging Face checkpoint, `lanllm model switch <ID>` can also download the model
 automatically when selected. The command requires all GPUs
 configured in `cluster.total_gpus` to be online; it rejects a model change if
 a worker is absent. Set `models.default_id` before starting the pool to choose
 its initial model. Run `lanllm model` without an ID to show the selected model.
 `models.default_id` in `lanllm.conf` is the initial default before a selection
 is made.
+The `[models.profiles."owner/repository"]` tables set model-specific vLLM
+options. `tool_call_parser` enables OpenAI `tool_choice: "auto"` requests.
+`served_model_names` adds API aliases while retaining the full Hugging Face ID.
+
+To import an existing Hugging Face Hub cache, use the `lanllm.import_cache`
+module with the snapshot revision. It
+hardlinks the snapshot into LanLLM's shared store, so the files use the same
+disk blocks and the original cache remains usable. A separately cached
+tokenizer can be imported with `--tokenizer`. The cache and store must be on
+the same filesystem.
+
+```bash
+cd /path/to/LanLLM
+sudo python3 -m lanllm.import_cache owner/repository SNAPSHOT_REVISION \
+  --cache /path/to/huggingface/hub --store /path/to/lanllm-store
+```
+
 For a gated model that may be served after a leader change, set `HF_TOKEN` on
 both hosts.
 
@@ -176,7 +187,7 @@ Stop with `lanllm stop` on both hosts. To remove LanLLM from a node, run
 `lanllm uninstall` there. It stops the container and removes the image,
 NFS export, project cache, command link, and repository checkout. For a model
 directory created by LanLLM it removes that dedicated directory. Existing
-models in `repos/vllm` are outside it. Run it on every node for a full cluster uninstall. It removes the
+models outside it remain untouched. Run it on every node for a full cluster uninstall. It removes the
 NFS server package only when LanLLM installed it and no other exports use it.
 Preview the removal with `lanllm uninstall --dry-run`. Use
 `lanllm uninstall --keep-source` to preserve the repository checkout.
