@@ -6,11 +6,13 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
-from urllib.request import urlopen
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 from lanllm.cluster import (
     allocate_layers,
     annotate_model_context,
+    ControlServer,
     ProxyServer,
     elect_leader,
     estimate_fit,
@@ -23,12 +25,78 @@ from lanllm.cluster import (
     mount_model_store,
     registered_nodes,
     selected_model,
+    selected_model_fit,
     selected_spec,
     verify_model_store,
 )
 
 
 class ElectionTests(unittest.TestCase):
+    def test_model_control_requires_worker_only_for_pool_fit(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = SimpleNamespace(
+                node_ip="127.0.0.1", control_port=0,
+                peer_ips=["127.0.0.1", "127.0.0.2"],
+                local_gpus=2, total_gpus=3,
+            )
+            state = SimpleNamespace(config=config, identity=lambda: {"role": "leader"})
+            server = ControlServer(state)
+            thread = threading.Thread(target=server.serve_forever)
+            thread.start()
+            models = [
+                {
+                    "model_id": f"ollama:{name}", "ref": f"ollama:{name}",
+                    "fit": fit, "backend": "llama.cpp", "source": "ollama",
+                    "relative_path": f"gguf/{name}.gguf", "weight_bytes": 1,
+                }
+                for name, fit in (("small", "leader"), ("large", "pool"))
+            ]
+            actual_path = Path
+            try:
+                with (
+                    patch("lanllm.cluster.query_node", return_value=None),
+                    patch("lanllm.cluster.registered_nodes", return_value=[]),
+                    patch("lanllm.cluster.model_catalog", return_value={"models": models}),
+                    patch(
+                        "lanllm.cluster.Path",
+                        side_effect=lambda value: (
+                            root / value.removeprefix("/models/")
+                            if value.startswith("/models/")
+                            else root if value == "/models" else actual_path(value)
+                        ),
+                    ),
+                ):
+                    def select(name: str):
+                        body = json.dumps({"model_id": f"ollama:{name}"}).encode()
+                        return Request(
+                            f"http://127.0.0.1:{server.server_address[1]}/model",
+                            data=body,
+                        )
+
+                    with urlopen(select("small"), timeout=2) as response:
+                        self.assertEqual(response.status, 200)
+                    self.assertEqual(
+                        json.loads((root / ".lanllm-selection.json").read_text())["ref"],
+                        "ollama:small",
+                    )
+                    with self.assertRaises(HTTPError) as failure:
+                        urlopen(select("large"), timeout=2)
+                    self.assertEqual(failure.exception.code, 409)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+    def test_selected_model_fit_controls_gpu_placement(self) -> None:
+        catalog = {"models": [
+            {"model_id": "small", "fit": "leader"},
+            {"model_id": "large", "fit": "pool"},
+        ]}
+        self.assertEqual(selected_model_fit(catalog, "small"), "leader")
+        self.assertEqual(selected_model_fit(catalog, "large"), "pool")
+        self.assertEqual(selected_model_fit(catalog, "missing"), "unknown")
+
     def test_model_context_is_advertised_for_runtime_discovery(self) -> None:
         listing = {
             "data": [
@@ -197,6 +265,7 @@ class StatusTests(unittest.TestCase):
         self.assertIn("192.168.2.26:50052", command)
         self.assertEqual(command[command.index("--port") + 1], "8001")
         self.assertEqual(command[command.index("--alias") + 1], config.model_id)
+        self.assertNotIn("--rpc", llama_server_command(config, []))
 
     def test_json_selection_supersedes_legacy_model(self) -> None:
         with TemporaryDirectory() as directory:

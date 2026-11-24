@@ -1,189 +1,225 @@
 # LanLLM
 
-Run Hugging Face and Ollama library models across NVIDIA GPUs on computers in
-one LAN. vLLM serves Hugging Face checkpoints; llama.cpp serves GGUF files from
-Hugging Face or the Ollama library.
+LanLLM serves models from Hugging Face and the Ollama library on NVIDIA GPUs
+connected by a LAN. Each node runs the same container and host command. vLLM
+handles supported Hugging Face checkpoints; llama.cpp handles single-file GGUF
+models. GPUs contribute memory and compute through pipeline stages or GPU RPC.
+Their VRAM is distributed across devices rather than presented as one physical
+GPU.
 
-Both hosts run the same Docker image, Compose service, and commands. A node
-finds its own LAN address, network interface, and GPU count. If another node
-is already leading, it joins that cluster; otherwise the first available
-node starts one. The leader runs vLLM or llama.cpp, and other nodes forward API
-traffic to it. vLLM uses Ray pipeline stages; llama.cpp uses GPU RPC. The
-worker mounts the leader's model folder over NFS using the elected leader IP.
+## How the nodes connect
 
-The model ID can be any Hugging Face model with an architecture and weight
-format supported by vLLM, provided its weights and KV cache fit the GPUs.
-GPU VRAM is distributed across stages, not exposed as one contiguous block.
-Models may need quantization or an uneven layer partition when GPUs have
-different VRAM capacities. Automatic partitioning assigns layers according to
-the available VRAM on each GPU.
+```mermaid
+flowchart LR
+    Client[API client] --> L[Leader :8001]
+    Client --> W[Worker :8001]
+    W -->|Forward requests| L
+    L --> S[(Model folder)]
+    W -.->|Read-only NFS mount| S
+    L --> G1[Leader GPUs]
+    L -->|Ray or GPU RPC when needed| G2[Worker GPUs]
+```
 
-## Start on either host
+LanLLM elects a leader from the configured nodes. A model that fits the
+leader's GPUs can run while a worker is offline. A larger model waits for the
+registered pool. The worker's API address forwards requests to the leader
+while the worker is online.
 
-Each host needs Docker, the NVIDIA Container Toolkit, and a CDI GPU
-specification. Generate
-`/etc/cdi/nvidia.yaml` with `sudo nvidia-ctk cdi generate
---output=/etc/cdi/nvidia.yaml`, then check access with `docker run --rm
---device nvidia.com/gpu=all ubuntu:24.04 nvidia-smi -L`.
+## Requirements
 
-`lanllm start` uses passwordless `sudo` to install and start the NFS server if
-needed. It uses the local model folder from `lanllm.conf` and exports it
-read-only to the other listed nodes. Each container mounts the elected
-leader's store at `/models`. The leader reads its local disk; workers read
-that same folder over the LAN. The containers need
-privileged mode to mount NFS inside their own mount namespaces.
-
-Put this repository on each host. Install the host command once on each:
+Each node needs Docker, the NVIDIA Container Toolkit, a working CDI GPU
+specification, and LAN access to the other nodes. Generate the CDI file and
+check Docker GPU access:
 
 ```bash
-cd ~/repos/LanLLM
+sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+docker run --rm --device nvidia.com/gpu=all ubuntu:24.04 nvidia-smi -L
+```
+
+`lanllm start` needs passwordless `sudo` for NFS setup. Nodes need TCP access
+for NFS on port 2049, the configured API and control ports, and Ray's worker
+ports. llama.cpp GPU RPC uses TCP port 50052 by default. The containers use
+host networking and privileged mode for the NFS mount.
+
+## Configure a node
+
+Copy the example on **each** node and edit `lanllm.conf`:
+
+```bash
+cd /path/to/LanLLM
 cp lanllm.conf.example lanllm.conf
-sudo ln -s "$PWD/bin/lanllm" /usr/local/bin/lanllm
 ```
 
-Edit `lanllm.conf` to choose `models.directory`, the default Hugging Face
-model, peer IPs, GPU count, inference settings, and API port. The directory
-is local to each host; it can differ between hosts. The default is
-`/srv/lanllm-store`. LanLLM creates and shares only
-its own folder. New downloads
-go into its `models/` and `gguf/` subfolders. Keep `.env` for optional secrets
-or settings absent from the TOML file; values in `lanllm.conf` take precedence.
+This example uses documentation addresses and a placeholder model ID. Replace
+them with the LAN addresses and model you intend to serve:
 
-Then run these same commands from **any directory** on either host:
+```toml
+[cluster]
+peers = ["192.0.2.10", "192.0.2.11"]
+total_gpus = 3
+
+[models]
+directory = "/srv/lanllm-store"
+default_id = "owner/repository"
+
+[inference]
+max_model_len = 8192
+gpu_memory_utilization = 0.9
+layer_partition = "auto"
+
+[api]
+port = 8001
+control_port = 8501
+```
+
+| Setting | Purpose |
+| --- | --- |
+| `cluster.peers` | Every node's LAN IP, including the current node. Use the same list everywhere. |
+| `cluster.total_gpus` | Total GPU count expected when a model needs the pool. Use the same value everywhere. |
+| `models.directory` | Local folder created and exported when this node leads. It may differ by node. |
+| `models.default_id` | Initial Hugging Face model before a selection is saved. |
+| `inference.max_model_len` | Context limit for llama.cpp and the vLLM fallback. |
+| `inference.gpu_memory_utilization` | GPU memory fraction used for capacity estimates and vLLM. |
+| `inference.layer_partition` | `auto` apportions vLLM layers by GPU memory when the pool is needed. |
+| `api.port` | OpenAI-compatible API on every node. Default: `8001`. |
+| `api.control_port` | Cluster state and model management. Default: `8501`. |
+
+LanLLM places downloads under `models.directory` in `models/` or `gguf/`.
+The leader exports one library; workers mount it read-only. The folder is
+created by LanLLM, and its location can be changed through the config file.
+
+For a vLLM model that needs special settings, add a profile keyed by its exact
+Hugging Face ID:
+
+```toml
+[models.profiles."owner/repository"]
+max_model_len = 8192
+tool_call_parser = "hermes"
+served_model_names = ["short-name"]
+```
+
+Choose a parser supported by that model. `tool_call_parser` also enables
+OpenAI `tool_choice: "auto"` in vLLM. Profiles can set `reasoning_parser`,
+`dtype`, `tokenizer`, `layer_partition`, `cpu_offload_gb`, and batching options.
+The `.env` file is available for optional secrets and settings not in the TOML
+file; `lanllm.conf` wins when both define the same setting. For gated Hugging
+Face repositories, provide `HF_TOKEN` on every node that might become leader.
+
+## Install and start
+
+Install the host command once per node:
 
 ```bash
+cd /path/to/LanLLM
+sudo ln -s "$PWD/bin/lanllm" /usr/local/bin/lanllm
 lanllm start
-lanllm
 ```
 
-`lanllm` (or `lanllm status`) prints a combined GPU table directly from the
-host, without Docker. `lanllm logs` follows startup logs; `lanllm stop`
-stops the local node.
+Run `lanllm start` on the other configured nodes when they are available. The
+command works from any directory after installation.
 
-`lanllm nodes` shows how many nodes have registered, how many are online, and
-each node's GPU count, total VRAM, CPU count, RAM, and GPU names. The leader
-records the last known capacity in its shared model folder, so an offline
-worker remains visible as offline. Run the same command on either host.
+| Command | Result |
+| --- | --- |
+| `lanllm` | GPU, VRAM, CPU, RAM, and API status across reachable nodes. |
+| `lanllm top` | Live terminal dashboard; press `q` to exit. |
+| `lanllm top --once` | One dashboard snapshot for scripts. |
+| `lanllm nodes` | Registered nodes, capacities, and online state. |
+| `lanllm models` | Downloaded models with leader and pool fit estimates. |
+| `lanllm logs` | Follow the local container logs. |
+| `lanllm stop` | Stop the local container. |
 
-`lanllm models` lists models downloaded in the leader's model folder and
-estimates whether their weight files fit the leader's GPUs alone, need the
-registered GPU pool, or exceed that pool. It also marks a pool-only model when
-the worker is offline. The estimate applies the configured GPU memory limit
-and reserves 2 GiB per GPU for runtime and KV cache; actual inference may
-need more memory. It shows the backend for each model. Models that have not
-been downloaded are not listed.
+`nvidia-smi` lists only the GPUs physically attached to its host. LanLLM's
+commands show the network pool. The node registry retains the last known
+capacity of offline workers.
 
-`lanllm top` opens a live terminal dashboard with CPU, RAM, network, GPU
-utilization, VRAM, temperature, and power for every reachable node. Press `q`
-to leave it. Use `lanllm top --once` for a single snapshot in scripts or
-terminals without interactive display support.
+## Find and download a model
 
-`cluster.peers` in `lanllm.conf` lists every node. Set the same model ID and
-GPU count on all nodes. The first node can start alone; it waits for the
-other GPU inventory and the requested GPU count before serving. Start the
-second node whenever ready. If the leader stops, a remaining node can become
-leader when the former leader's control endpoint becomes unreachable. The API
-is ready again after the requested GPU count rejoins and the model loads.
+```mermaid
+flowchart LR
+    Source[Hugging Face or Ollama source] --> Fit[lanllm fit]
+    Fit --> Choice{Placement}
+    Choice -->|Leader fit| Local[Uses leader GPUs]
+    Choice -->|Pool fit| Shared[Uses all required nodes]
+    Local --> Download[lanllm download]
+    Shared --> Download
+    Download --> Store[(One leader copy)]
+    Store --> Switch[lanllm switch]
+    Switch --> Ready[API ready]
+```
 
-The table shows the GPU name, temperature, utilization, VRAM usage, power, and
-CPU/RAM summary for every reachable node. `nvidia-smi` still shows only the
-physical GPUs on the host where it runs.
+Start with `lanllm fit` to inspect weight variants in a source. It reserves
+2 GiB per GPU for runtime and prefers a further 10% headroom. A fit estimate
+cannot guarantee that a model architecture or context size will run.
 
-The OpenAI-compatible API is available on **both** LAN addresses:
+```bash
+lanllm fit owner/repository
+lanllm fit owner/gguf-repository --backend llama.cpp
+lanllm fit owner/gguf-repository --backend llama.cpp --file model.Q8_K.gguf
+lanllm fit ollama:model:tag
+```
+
+The recommendation favors headroom and may select a variant that fits the
+leader alone. To use the worker GPUs, inspect a larger variant with `--file`;
+its result must say `pool`. A `pool, tight` result needs a real loading test
+because the memory estimate does not account for every runtime allocation.
+
+Download a chosen source on either node. The leader stores the files once:
+
+```bash
+lanllm download owner/repository
+lanllm download owner/gguf-repository --backend llama.cpp --file model.Q6_K.gguf
+lanllm download owner/gguf-repository --backend llama.cpp --file model.Q8_K.gguf
+lanllm download ollama:model:tag
+lanllm download
+```
+
+The final command follows an existing download. A plain Hugging Face ID or
+`https://huggingface.co/owner/repository` URL selects vLLM. For GGUF, specify
+`--backend llama.cpp`; add `--file` if the repository contains multiple GGUF
+files. An `ollama:model:tag` name or Ollama library URL selects llama.cpp.
+The Ollama path supports one GGUF weight layer; models requiring a projector
+or other extra weights are rejected.
+
+Downloading leaves the current model running. Use the reference printed at
+completion or shown by `lanllm models` to select it:
+
+```bash
+lanllm switch owner/repository
+lanllm switch 'hf:owner/gguf-repository@model.Q6_K.gguf'
+lanllm switch ollama:model:tag
+```
+
+`lanllm switch` waits until the selected model appears on every required API
+address. A leader-fit model can start without a worker; a pool-fit model waits
+for all configured GPUs. `lanllm fit owner/repository --apply` combines
+inspection, download, and switch for the recommended variant. A model beyond
+the online capacity is rejected before download.
+
+## Call the API
+
+Both online nodes expose the same OpenAI-compatible API:
 
 ```text
 http://<node-a-lan-ip>:8001/v1
 http://<node-b-lan-ip>:8001/v1
 ```
 
-Clients can read the active model's context limit from `max_model_len` or
-`meta.n_ctx` in `/v1/models`. A request that includes a large system prompt or
-many tool definitions may exceed that limit before its user message is counted.
-
-Only one inference server can bind port 8001 on a host at a time. Change
-`api.port` on every node if another service uses it.
-
-For example, run this on either host:
+The active model and its context limit are available at `/v1/models`. The
+response includes `max_model_len` and `meta.n_ctx` for clients that discover
+local model limits. Tool definitions and system prompts count toward that
+limit.
 
 ```bash
-curl http://127.0.0.1:8001/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"Qwen/Qwen2.5-14B-Instruct","messages":[{"role":"user","content":"Hello"}],"max_tokens":32}'
+curl http://<node-lan-ip>:8001/v1/models
 ```
 
-## Use another model
+Only one service can bind the configured API port on a host. Change `api.port`
+on every node if another process already uses it.
 
-Inspect a Hugging Face repository or Ollama library entry before downloading:
+## Existing caches and advanced settings
 
-```bash
-lanllm fit owner/repository
-lanllm fit owner/gguf-repository --backend llama.cpp
-lanllm fit ollama:model:tag
-lanllm fit owner/repository --apply
-```
-
-The fit command compares weight sizes with the GPUs currently online, reserves
-2 GiB per GPU for runtime, and prefers a further 10% headroom. It selects a
-vLLM checkpoint or a single-file GGUF variant within the requested source.
-`--apply` downloads the recommendation into the shared folder and switches to
-it when all configured GPUs are online. The estimate cannot guarantee that an
-architecture, context length, or workload will run. For a model that is too
-large, provide a quantized repository or a smaller model.
-
-Download on either host; the leader stores one copy in `models.directory`:
-
-```bash
-lanllm download Qwen/Qwen2.5-14B-Instruct
-lanllm download ollama:qwen2.5:0.5b
-lanllm download https://ollama.com/library/qwen2.5:0.5b
-lanllm download owner/gguf-repository --backend llama.cpp --file model.Q4_K_M.gguf
-lanllm models
-```
-
-Plain Hugging Face IDs and `https://huggingface.co/owner/repository` URLs use
-vLLM by default. Meta Llama repositories on Hugging Face work when your account
-has access; set `HF_TOKEN` in `lanllm.conf` or `.env` on the leader. For a GGUF
-repository, add `--backend llama.cpp`; LanLLM selects its single Q4_K_M file
-automatically when unambiguous, otherwise specify `--file`. Ollama library
-names and URLs use llama.cpp. The Ollama download extracts the GGUF weight blob
-directly into the shared model store without keeping a second Ollama cache.
-The current Ollama path supports models with one GGUF weight layer; models that
-require extra projector files are rejected.
-Run `lanllm download` without a model to follow the current download from
-either host.
-
-Downloading does not interrupt the running model. To serve a downloaded model,
-copy its reference from `lanllm models` or the download completion message:
-
-```bash
-lanllm model switch Qwen/Qwen2.5-14B-Instruct
-lanllm model switch ollama:qwen2.5:0.5b
-```
-
-`lanllm model switch <ID>` (or the shorter `lanllm switch <ID>`) sends the
-selection to the running leader; both nodes restart
-their inference processes when it changes. The command waits until the
-selected model appears on both API addresses, or reports a startup timeout.
-vLLM uses Ray pipeline stages;
-llama.cpp exposes each worker's GPUs through its RPC backend on TCP 50052.
-Workers read the leader's model folder over NFS without a local disk copy.
-For a Hugging Face checkpoint, `lanllm model switch <ID>` can also download the model
-automatically when selected. The command requires all GPUs
-configured in `cluster.total_gpus` to be online; it rejects a model change if
-a worker is absent. Set `models.default_id` before starting the pool to choose
-its initial model. Run `lanllm model` without an ID to show the selected model.
-`models.default_id` in `lanllm.conf` is the initial default before a selection
-is made.
-The `[models.profiles."owner/repository"]` tables set model-specific vLLM
-options. `tool_call_parser` enables OpenAI `tool_choice: "auto"` requests.
-`served_model_names` adds API aliases while retaining the full Hugging Face ID.
-
-To import an existing Hugging Face Hub cache, use the `lanllm.import_cache`
-module with the snapshot revision. It
-hardlinks the snapshot into LanLLM's shared store, so the files use the same
-disk blocks and the original cache remains usable. A separately cached
-tokenizer can be imported with `--tokenizer`. The cache and store must be on
-the same filesystem.
+A Hugging Face Hub snapshot on the same filesystem can be hardlinked into the
+shared library without duplicating its disk blocks:
 
 ```bash
 cd /path/to/LanLLM
@@ -191,35 +227,22 @@ sudo python3 -m lanllm.import_cache owner/repository SNAPSHOT_REVISION \
   --cache /path/to/huggingface/hub --store /path/to/lanllm-store
 ```
 
-For a gated model that may be served after a leader change, set `HF_TOKEN` on
-both hosts.
+For vLLM, `layer_partition = "auto"` allocates model layers according to the
+memory visible on each GPU when the pool is used. A manual partition contains
+one layer count per GPU, and the counts must sum to the model's hidden layers.
+`trust_remote_code = true` executes repository code; set it only for a trusted
+source. Ray's network services and llama.cpp GPU RPC are intended for a trusted
+LAN.
 
-Optional settings include `HF_REVISION`, `QUANTIZATION`, `DTYPE`,
-`MAX_MODEL_LEN`, `GPU_MEMORY_UTILIZATION`, and `LAYER_PARTITION`. A partition
-has one hidden-layer count per GPU, totaling the model's layer count. Check
-the logs for actual pipeline rank placement before assigning an uneven
-partition. Set `LAYER_PARTITION=auto` to apportion layers by GPU VRAM with
-extra room reserved on small cards. The nodes calculate the same partition
-based on the elected leader's GPU order. `TRUST_REMOTE_CODE=1` runs code
-from a model repository; set it only for a trusted model.
+## Remove LanLLM
 
-The API listens on all LAN interfaces. Restrict access with a firewall or
-API gateway on networks you do not trust. Ray and the leader election use
-host networking. The nodes need TCP access to one another, including NFS on
-TCP port 2049 and Ray's dynamic worker ports. If the leader changes to a node
-without the selected model, that node downloads it into its own local store.
-llama.cpp also needs TCP port 50052 between nodes for RPC. Its RPC backend is
-intended for trusted local networks and is still experimental.
+Run `lanllm stop` and `lanllm uninstall` on every node. Uninstall removes the
+container, image, NFS export, command link, project cache, and checkout. It
+removes a model directory only when LanLLM created that dedicated directory;
+existing model files outside it remain. Preview with
+`lanllm uninstall --dry-run`, or keep the checkout with
+`lanllm uninstall --keep-source`.
 
-Stop with `lanllm stop` on both hosts. To remove LanLLM from a node, run
-`lanllm uninstall` there. It stops the container and removes the image,
-NFS export, project cache, command link, and repository checkout. For a model
-directory created by LanLLM it removes that dedicated directory. Existing
-models outside it remain untouched. Run it on every node for a full cluster uninstall. It removes the
-NFS server package only when LanLLM installed it and no other exports use it.
-Preview the removal with `lanllm uninstall --dry-run`. Use
-`lanllm uninstall --keep-source` to preserve the repository checkout.
-
-LanLLM uses [vLLM's official container image](https://docs.vllm.ai/en/latest/deployment/docker/)
-and Ray's [on-premise cluster approach](https://docs.ray.io/en/latest/cluster/vms/user-guides/launching-clusters/on-premises.html).
-The GGUF backend uses [llama.cpp RPC](https://github.com/ggml-org/llama.cpp/blob/master/tools/rpc/README.md).
+LanLLM uses [vLLM's container image](https://docs.vllm.ai/en/latest/deployment/docker/),
+[Ray for multi-node execution](https://docs.ray.io/en/latest/cluster/vms/user-guides/launching-clusters/on-premises.html),
+and [llama.cpp GPU RPC](https://github.com/ggml-org/llama.cpp/blob/master/tools/rpc/README.md).

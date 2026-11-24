@@ -40,6 +40,9 @@ class ModelSelectionTests(unittest.TestCase):
             select_model.__globals__,
             {
                 "configuration": lambda: settings,
+                "leader_endpoint": lambda *_args: {
+                    "models": [{"model_id": "Qwen/Qwen2.5-14B-Instruct", "fit": "pool"}]
+                },
                 "query_node": lambda ip, *_args, **_kwargs: (
                     leader if ip == "192.168.2.33" else None
                 ),
@@ -47,6 +50,34 @@ class ModelSelectionTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ValueError, "Only 2/3 GPUs are online"):
                 select_model("Qwen/Qwen2.5-14B-Instruct")
+
+    def test_leader_fit_model_can_switch_without_worker(self) -> None:
+        command = runpy.run_path(str(Path(__file__).parents[1] / "bin/lanllm"))
+        select_model = command["model"]
+        leader = {
+            "node_ip": "192.168.2.33",
+            "role": "leader",
+            "model_id": "Qwen/Qwen2.5-14B-Instruct",
+            "gpus": [{"index": "0"}, {"index": "1"}],
+        }
+        settings = {"PEER_IPS": "192.168.2.33,192.168.2.26", "TOTAL_GPUS": "3"}
+        with patch.dict(
+            select_model.__globals__,
+            {
+                "configuration": lambda: settings,
+                "leader_endpoint": lambda *_args: {
+                    "models": [{"model_id": "Qwen/Qwen3-8B", "fit": "leader"}]
+                },
+                "query_node": lambda ip, *_args, **_kwargs: (
+                    leader if ip == "192.168.2.33" else None
+                ),
+                "post_leader": lambda *_args: {},
+                "wait_for_model_ready": lambda *_args, **kwargs: self.assertEqual(
+                    kwargs["peers"], ["192.168.2.33"]
+                ),
+            },
+        ):
+            self.assertEqual(select_model("Qwen/Qwen3-8B"), 0)
 
 
 if __name__ == "__main__":

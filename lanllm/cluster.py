@@ -344,12 +344,6 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
             peer = query_node(ip, config.control_port, full=True)
             if peer is not None:
                 online_gpus += len(peer["gpus"])
-        if online_gpus < config.total_gpus:
-            self.send_error(
-                409,
-                f"Only {online_gpus}/{config.total_gpus} GPUs are online",
-            )
-            return
         try:
             model_id = data["model_id"]
             if not isinstance(model_id, str):
@@ -363,6 +357,9 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 ]
                 if len(matches) != 1:
                     raise ValueError("Model is not available in the leader's library")
+                fit = matches[0]["fit"]
+                if fit == "too_large":
+                    raise ValueError("Selected model exceeds the registered GPU pool capacity")
                 selection = {
                     key: matches[0][key]
                     for key in (
@@ -374,9 +371,17 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                     )
                 }
             else:
+                fit = "unknown"
                 selection = model_metadata(parse_source(model_id), 0)
         except (ValueError, KeyError, TypeError) as exc:
             self.send_error(400, str(exc))
+            return
+        required_gpus = config.local_gpus if fit == "leader" else config.total_gpus
+        if online_gpus < required_gpus:
+            self.send_error(
+                409,
+                f"Only {online_gpus}/{required_gpus} GPUs are online",
+            )
             return
         temporary = (
             Path("/models") / f".lanllm-selection.{os.getpid()}.{threading.get_ident()}"
@@ -656,6 +661,13 @@ def model_catalog(
     }
 
 
+def selected_model_fit(catalog: dict, model_id: str) -> str:
+    return next(
+        (item["fit"] for item in catalog["models"] if item["model_id"] == model_id),
+        "unknown",
+    )
+
+
 def start_download(spec: dict, state: State) -> None:
     global DOWNLOAD_JOB
     with DOWNLOAD_LOCK:
@@ -933,7 +945,7 @@ def llama_rpc_command(config: Config) -> list[str]:
 
 
 def llama_server_command(config: Config, endpoints: list[str]) -> list[str]:
-    return [
+    command = [
         "llama-server",
         "--model",
         str(config.model_path),
@@ -947,9 +959,10 @@ def llama_server_command(config: Config, endpoints: list[str]) -> list[str]:
         config.env.get("MAX_MODEL_LEN", "2048"),
         "--n-gpu-layers",
         "all",
-        "--rpc",
-        ",".join(endpoints),
     ]
+    if endpoints:
+        command += ["--rpc", ",".join(endpoints)]
+    return command
 
 
 def lower_priority_leader(config: Config) -> str | None:
@@ -993,6 +1006,24 @@ def run_worker(config: Config, state: State, leader_ip: str) -> None:
     try:
         if not wait_for_model(config, leader_ip):
             return
+        try:
+            with urllib.request.urlopen(
+                f"http://{leader_ip}:{config.control_port}/models", timeout=10
+            ) as response:
+                leader_fit = selected_model_fit(json.load(response), config.model_id)
+        except (OSError, ValueError, KeyError, urllib.error.URLError):
+            leader_fit = "unknown"
+        if leader_fit == "leader":
+            print("Selected model runs on the leader's local GPUs", flush=True)
+            while True:
+                leader = query_node(leader_ip, config.control_port)
+                if leader is None or leader.get("role") != "leader":
+                    failures += 1
+                    if failures >= 3:
+                        return
+                else:
+                    failures = 0
+                time.sleep(2)
         if config.backend == "llama.cpp":
             process = subprocess.Popen(llama_rpc_command(config))
             while process.poll() is None:
@@ -1041,6 +1072,15 @@ def run_leader(config: Config, state: State) -> None:
     state.set("leader", config.node_ip)
     if lower_priority_leader(config) is not None:
         return
+    nodes = registered_nodes(config, state)
+    fit = selected_model_fit(model_catalog(config, nodes), config.model_id)
+    local_only = fit == "leader"
+    target_gpus = config.local_gpus if local_only else config.total_gpus
+    print(
+        f"Model placement: {'leader' if local_only else 'pool'} "
+        f"({target_gpus} GPU(s))",
+        flush=True,
+    )
     while True:
         peers = [
             peer
@@ -1053,10 +1093,10 @@ def run_leader(config: Config, state: State) -> None:
         available_gpus = config.local_gpus + sum(len(peer["gpus"]) for peer in peers)
         if winner != config.node_ip:
             return
-        if available_gpus >= config.total_gpus:
+        if available_gpus >= target_gpus:
             break
         print(
-            f"Waiting for GPU inventory: {available_gpus}/{config.total_gpus}",
+            f"Waiting for GPU inventory: {available_gpus}/{target_gpus}",
             flush=True,
         )
         time.sleep(5)
@@ -1065,10 +1105,11 @@ def run_leader(config: Config, state: State) -> None:
         if not model_ready(config):
             raise RuntimeError(f"Download {config.model_id} before selecting it")
         rpc_port = int(config.env.get("LLAMA_RPC_PORT", "50052"))
-        endpoints = [
-            f"{ip}:{rpc_port}" for ip in config.peer_ips if ip != config.node_ip
-        ]
-        while not all(
+        endpoints = (
+            [f"{ip}:{rpc_port}" for ip in config.peer_ips if ip != config.node_ip]
+            if not local_only else []
+        )
+        while endpoints and not all(
             reachable(ip, rpc_port) for ip in config.peer_ips if ip != config.node_ip
         ):
             print("Waiting for llama.cpp RPC workers", flush=True)
@@ -1085,8 +1126,11 @@ def run_leader(config: Config, state: State) -> None:
             stop_process(server)
     ensure_model(config)
     settings = config.settings(
-        "head", config.node_ip, resolve_partition(config, config.node_ip)
+        "head", config.node_ip,
+        "" if local_only else resolve_partition(config, config.node_ip),
     )
+    if local_only:
+        settings = replace(settings, total_gpus=config.local_gpus)
     internal_port = config.api_port + 10000
     if internal_port > 65535:
         raise ValueError("API_PORT must be at most 55535")

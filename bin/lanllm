@@ -27,6 +27,7 @@ from lanllm.cluster import (  # noqa: E402
     local_ip_for,
     query_node,
     selected_model,
+    selected_model_fit,
     selected_spec,
     verify_model_store,
 )
@@ -220,7 +221,10 @@ def fit(source: str, backend: str | None, filename: str, apply: bool) -> int:
             raise ValueError("No fitting variant to download")
         return 0
     if apply:
-        if plan["online_gpus"] < plan["required_gpus"]:
+        if (
+            recommendation["fit"] == "pool"
+            and plan["online_gpus"] < plan["required_gpus"]
+        ):
             raise ValueError("Start the missing GPU worker before applying a model fit")
         download(
             recommendation["source"],
@@ -571,24 +575,37 @@ def model(model_id: str | None) -> int:
         )
     if leader is None:
         raise ValueError("Start the GPU pool before selecting a model")
+    catalog = leader_endpoint(values, "models")
+    fit = selected_model_fit(catalog, model_id)
+    if fit == "too_large":
+        raise ValueError("Selected model exceeds the registered GPU pool capacity")
     online_gpus = sum(len(state["gpus"]) for state in states if state)
-    required_gpus = int(values.get("TOTAL_GPUS", "3"))
+    required_gpus = (
+        len(leader["gpus"]) if fit == "leader"
+        else int(values.get("TOTAL_GPUS", "3"))
+    )
     if online_gpus < required_gpus:
         raise ValueError(
             f"Only {online_gpus}/{required_gpus} GPUs are online; "
             "start the missing worker before selecting a model"
         )
     post_leader(values, "model", {"model_id": model_id})
-    print(f"Selected {model_id}; waiting for both API addresses to serve it", flush=True)
-    wait_for_model_ready(values, model_id)
-    print(f"Ready: {model_id} on every node")
+    required_peers = [leader["node_ip"]] if fit == "leader" else peer_ips(values)
+    address_word = "address" if len(required_peers) == 1 else "addresses"
+    print(
+        f"Selected {model_id}; waiting for {len(required_peers)} API {address_word}",
+        flush=True,
+    )
+    wait_for_model_ready(values, model_id, peers=required_peers)
+    print(f"Ready: {model_id} on {', '.join(required_peers)}")
     return 0
 
 
 def wait_for_model_ready(
-    values: dict[str, str], model_id: str, timeout: int = 600
+    values: dict[str, str], model_id: str, timeout: int = 600,
+    peers: list[str] | None = None,
 ) -> None:
-    peers = peer_ips(values)
+    peers = peers or peer_ips(values)
     port = int(values.get("API_PORT", "8001"))
     deadline = time.monotonic() + timeout
     last_report = 0.0
