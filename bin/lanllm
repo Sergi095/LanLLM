@@ -209,32 +209,71 @@ def nodes() -> int:
 
 def models() -> int:
     data = leader_endpoint(configuration(), "models")
+    print(format_models(data, shutil.get_terminal_size((80, 24)).columns))
+    return 0
+
+
+def format_models(data: dict, terminal_width: int) -> str:
     leader_gib = data["leader_usable_mib"] / 1024
     pool_gib = data["registered_usable_mib"] / 1024
-    print(
-        f"Model fit estimate: leader {leader_gib:.1f} GiB, "
-        f"registered pool {pool_gib:.1f} GiB "
-        f"({data['online_nodes']}/{data['registered_nodes']} nodes online)"
-    )
-    print(f"{'Model':<42} {'Backend':<10} {'Weights':>10}  Fit")
-    for entry in data["models"]:
-        fit = {
-            "leader": "leader alone",
-            "pool": "registered pool",
-            "too_large": "too large",
-            "unknown": "unknown",
-        }[entry["fit"]]
-        if entry["fit"] == "pool" and not entry["fits_online_vram"]:
-            fit += " (worker offline)"
-        gib = entry["weight_bytes"] / (1024**3)
-        print(
-            f"{entry['model_id']:<42} {entry.get('backend', 'vllm'):<10} "
-            f"{gib:>8.1f} GiB  {fit}"
-        )
+    lines = [
+        f"Nodes: {data['online_nodes']}/{data['registered_nodes']} online  |  "
+        f"Usable VRAM: leader {leader_gib:.1f} GiB, pool {pool_gib:.1f} GiB",
+        "",
+    ]
     if not data["models"]:
-        print("No downloaded models in the leader store")
-    print("Estimate reserves 2 GiB per GPU for runtime and KV cache.")
-    return 0
+        return "\n".join([*lines, "No downloaded models in the leader store"])
+
+    if terminal_width < 70:
+        for entry in data["models"]:
+            fit = model_fit_label(entry)
+            gib = entry["weight_bytes"] / (1024**3)
+            lines.extend(
+                [
+                    entry["model_id"],
+                    f"  {gib:.1f} GiB  |  {entry.get('backend', 'vllm')}  |  {fit}",
+                ]
+            )
+    else:
+        name_width = min(
+            max(len(entry["model_id"]) for entry in data["models"]),
+            terminal_width - 45,
+        )
+        lines.append(
+            f"{'MODEL':<{name_width}}  {'WEIGHTS':>10}  {'BACKEND':<9}  FIT"
+        )
+        lines.append("─" * min(terminal_width, name_width + 45))
+        for entry in data["models"]:
+            name = entry["model_id"]
+            fit = model_fit_label(entry)
+            gib = entry["weight_bytes"] / (1024**3)
+            if len(name) > name_width:
+                lines.append(name)
+                name = ""
+            lines.append(
+                f"{name:<{name_width}}  {gib:>7.1f} GiB  "
+                f"{entry.get('backend', 'vllm'):<9}  {fit}"
+            )
+    lines.extend(
+        [
+            "",
+            "Fit: Leader = local GPUs; Pool = all registered GPUs. "
+            "Reserves 2 GiB per GPU.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def model_fit_label(entry: dict) -> str:
+    fit = {
+        "leader": "Leader",
+        "pool": "Pool",
+        "too_large": "Too large",
+        "unknown": "Unknown",
+    }[entry["fit"]]
+    if entry["fit"] == "pool" and not entry["fits_online_vram"]:
+        fit += " (offline)"
+    return fit
 
 
 def peer_ips(values: dict[str, str]) -> list[str]:
