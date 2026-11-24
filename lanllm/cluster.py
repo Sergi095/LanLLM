@@ -18,6 +18,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -207,6 +208,7 @@ class Config:
 class State:
     def __init__(self, config: Config):
         self.config = config
+        self.instance_id = uuid.uuid4().hex
         self.role = "candidate"
         self.leader_ip = ""
         self.lock = threading.Lock()
@@ -235,6 +237,7 @@ class State:
         )
         return {
             "node_ip": self.config.node_ip,
+            "instance_id": self.instance_id,
             "role": role,
             "leader_ip": leader_ip,
             "store_priority": int(has_model or has_selection),
@@ -698,6 +701,16 @@ def selected_model_fit(catalog: dict, model_id: str) -> str:
 
 def online_gpu_count(nodes: list[dict]) -> int:
     return sum(len(node["gpus"]) for node in nodes if node["online"])
+
+
+def pool_instances_match(expected: dict[str, str], control_port: int) -> bool:
+    return all(
+        expected_id
+        and (peer := query_node(ip, control_port)) is not None
+        and peer.get("role") == "worker"
+        and peer.get("instance_id") == expected_id
+        for ip, expected_id in expected.items()
+    )
 
 
 def delete_downloaded_model(
@@ -1202,6 +1215,10 @@ def run_leader(config: Config, state: State) -> None:
             flush=True,
         )
         time.sleep(5)
+    expected_instances = (
+        {peer["node_ip"]: peer.get("instance_id", "") for peer in peers}
+        if not local_only else {}
+    )
     registered_nodes(config, state)
     if config.backend == "llama.cpp":
         if not model_ready(config):
@@ -1222,7 +1239,10 @@ def run_leader(config: Config, state: State) -> None:
                 if lower_priority_leader(config) is not None:
                     return
                 nodes = registered_nodes(config, state)
-                if not local_only and online_gpu_count(nodes) < target_gpus:
+                if not local_only and (
+                    online_gpu_count(nodes) < target_gpus
+                    or not pool_instances_match(expected_instances, config.control_port)
+                ):
                     print("GPU pool lost capacity; stopping model", flush=True)
                     return
                 time.sleep(5)
@@ -1276,7 +1296,10 @@ def run_leader(config: Config, state: State) -> None:
                     return
                 if time.monotonic() - last_registry_update >= 15:
                     nodes = registered_nodes(config, state)
-                    if not local_only and online_gpu_count(nodes) < target_gpus:
+                    if not local_only and (
+                        online_gpu_count(nodes) < target_gpus
+                        or not pool_instances_match(expected_instances, config.control_port)
+                    ):
                         print("GPU pool lost capacity; stopping model", flush=True)
                         return
                     last_registry_update = time.monotonic()

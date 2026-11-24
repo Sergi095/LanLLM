@@ -158,13 +158,16 @@ class ElectionTests(unittest.TestCase):
         self.assertEqual(selected_model_fit(catalog, "missing"), "unknown")
 
     def test_online_gpu_count_excludes_registered_offline_nodes(self) -> None:
-        from lanllm.cluster import online_gpu_count
+        from lanllm.cluster import online_gpu_count, pool_instances_match
 
         nodes = [
             {"online": True, "gpus": [{}, {}]},
             {"online": False, "gpus": [{}]},
         ]
         self.assertEqual(online_gpu_count(nodes), 2)
+        with patch("lanllm.cluster.query_node", return_value={"instance_id": "new", "role": "worker"}):
+            self.assertTrue(pool_instances_match({"192.0.2.11": "new"}, 8501))
+            self.assertFalse(pool_instances_match({"192.0.2.11": "old"}, 8501))
 
     def test_model_context_is_advertised_for_runtime_discovery(self) -> None:
         listing = {
