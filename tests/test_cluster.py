@@ -432,6 +432,16 @@ class StatusTests(unittest.TestCase):
         self.assertIn("5,000 / 16,303 MiB VRAM used", output)
         self.assertIn("192.168.2.26: offline", output)
 
+    def test_status_does_not_show_default_model_while_waiting(self) -> None:
+        state = {
+            "node_ip": "192.168.2.33", "role": "candidate",
+            "model_id": "Qwen/Qwen2.5-14B-Instruct", "gpus": [],
+            "cpus": 16, "ram_available_gib": 20.0, "ram_total_gib": 32.0,
+        }
+        output = format_status([state], ["192.168.2.26"], 8001)
+        self.assertIn("Model: none loaded", output)
+        self.assertNotIn("Model: Qwen/Qwen2.5-14B-Instruct", output)
+
     def test_unmounted_store_is_rejected(self) -> None:
         with TemporaryDirectory() as directory:
             store = Path(directory)

@@ -1366,10 +1366,15 @@ def run(config: Config) -> None:
 def format_status(states: list[dict], offline: list[str], api_port: int) -> str:
     lines = ["LanLLM GPU pool", "=" * 109]
     if states:
-        leaders = [state["node_ip"] for state in states if state["role"] == "leader"]
-        leader = leaders[0] if leaders else "starting"
-        backend = states[0].get("backend", "vllm")
-        lines.append(f"Model: {states[0]['model_id']} ({backend})   Leader: {leader}")
+        leaders = [state for state in states if state["role"] == "leader"]
+        if leaders:
+            active = leaders[0]
+            backend = active.get("backend", "vllm")
+            lines.append(
+                f"Model: {active['model_id']} ({backend})   Leader: {active['node_ip']}"
+            )
+        else:
+            lines.append("Model: none loaded   Leader: starting")
     lines.append(
         f"{'Node / role':<25} {'GPU':<3} {'Name':<36} {'Temp':>5} "
         f"{'Util':>5} {'VRAM used / total':>21} {'Power':>8}"
