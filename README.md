@@ -120,6 +120,9 @@ served_model_names = ["short-name"]
 Choose a parser supported by that model. `tool_call_parser` also enables
 OpenAI `tool_choice: "auto"` in vLLM. Profiles can set `reasoning_parser`,
 `dtype`, `tokenizer`, `layer_partition`, `cpu_offload_gb`, and batching options.
+See the [model configuration guide](docs/model-configuration.md) for backend
+settings and the [pipeline partitioning guide](docs/pipeline-partitioning.md)
+for tuning a model across GPUs.
 The `.env` file is available for optional secrets and settings not in the TOML
 file; `lanllm.conf` wins when both define the same setting. For gated Hugging
 Face repositories, provide `HF_TOKEN` on every node that might become leader.
