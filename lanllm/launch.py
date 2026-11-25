@@ -40,6 +40,8 @@ class Settings:
     max_num_seqs: int = 0
     max_num_batched_tokens: int = 0
     gdn_prefill_backend: str = ""
+    linear_backend: str = ""
+    language_model_only: bool = False
 
     @classmethod
     def from_environment(
@@ -70,7 +72,17 @@ class Settings:
         utilization = float(env.get("GPU_MEMORY_UTILIZATION", "0.7"))
         if not 0 < utilization <= 1:
             raise ValueError("GPU_MEMORY_UTILIZATION must be in (0, 1]")
-        partition = env.get("LAYER_PARTITION", "").strip()
+        model_id = required("MODEL_ID")
+        profiles = json.loads(env.get("MODEL_PROFILES_JSON", "{}"))
+        if not isinstance(profiles, dict):
+            raise ValueError("models.profiles must be a table")
+        profile = profiles.get(model_id, {})
+        if not isinstance(profile, dict):
+            raise ValueError(f"Profile for {model_id} must be a table")
+        utilization = float(profile.get("gpu_memory_utilization", utilization))
+        if not 0 < utilization <= 1:
+            raise ValueError("gpu_memory_utilization must be in (0, 1]")
+        partition = str(profile.get("layer_partition") or env.get("LAYER_PARTITION", "")).strip()
         if partition:
             try:
                 layers = [int(part) for part in partition.split(",")]
@@ -80,14 +92,6 @@ class Settings:
                 ) from exc
             if len(layers) != total_gpus or any(layer < 1 for layer in layers):
                 raise ValueError("LAYER_PARTITION needs one positive count per GPU")
-
-        model_id = required("MODEL_ID")
-        profiles = json.loads(env.get("MODEL_PROFILES_JSON", "{}"))
-        if not isinstance(profiles, dict):
-            raise ValueError("models.profiles must be a table")
-        profile = profiles.get(model_id, {})
-        if not isinstance(profile, dict):
-            raise ValueError(f"Profile for {model_id} must be a table")
         names = profile.get("served_model_names", [])
         if not isinstance(names, list) or not all(isinstance(name, str) and name for name in names):
             raise ValueError("served_model_names must be a list of nonempty strings")
@@ -114,7 +118,7 @@ class Settings:
             layer_partition=partition,
             trust_remote_code=bool(profile.get("trust_remote_code", env.get("TRUST_REMOTE_CODE", "0") == "1")),
             pool_wait_timeout=positive("POOL_WAIT_TIMEOUT", "600"),
-            served_model_names=tuple(dict.fromkeys([*names, model_id])),
+            served_model_names=tuple(dict.fromkeys([*names, "lanllm", model_id])),
             tool_call_parser=str(profile.get("tool_call_parser", "")),
             reasoning_parser=str(profile.get("reasoning_parser", "")),
             tokenizer=str(profile.get("tokenizer", "")),
@@ -123,6 +127,8 @@ class Settings:
             max_num_seqs=int(profile.get("max_num_seqs", 0)),
             max_num_batched_tokens=int(profile.get("max_num_batched_tokens", 0)),
             gdn_prefill_backend=str(profile.get("gdn_prefill_backend", "")),
+            linear_backend=str(profile.get("linear_backend", "")),
+            language_model_only=bool(profile.get("language_model_only", False)),
         )
 
 
@@ -189,6 +195,8 @@ def vllm_command(settings: Settings) -> list[str]:
             command += [flag, value]
     if settings.trust_remote_code:
         command.append("--trust-remote-code")
+    if settings.language_model_only:
+        command.append("--language-model-only")
     if settings.tool_call_parser:
         command.append("--enable-auto-tool-choice")
     if settings.cpu_offload_gb:
@@ -199,6 +207,8 @@ def vllm_command(settings: Settings) -> list[str]:
         command += ["--max-num-batched-tokens", str(settings.max_num_batched_tokens)]
     if settings.gdn_prefill_backend:
         command += ["--additional-config", json.dumps({"gdn_prefill_backend": settings.gdn_prefill_backend})]
+    if settings.linear_backend:
+        command += ["--kernel-config", json.dumps({"linear_backend": settings.linear_backend})]
     return command
 
 

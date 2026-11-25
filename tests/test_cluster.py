@@ -336,7 +336,10 @@ class StatusTests(unittest.TestCase):
         command = llama_server_command(config, ["192.168.2.26:50052"])
         self.assertIn("192.168.2.26:50052", command)
         self.assertEqual(command[command.index("--port") + 1], "8001")
-        self.assertEqual(command[command.index("--alias") + 1], config.model_id)
+        self.assertEqual(
+            command[command.index("--alias") + 1],
+            f"{config.model_id},lanllm",
+        )
         self.assertEqual(command[command.index("--parallel") + 1], "2")
         self.assertEqual(command[command.index("--tensor-split") + 1], "4,4,1")
         for flag, value in (("--cache-type-k", "q8_0"), ("--cache-type-v", "q8_0"), ("--batch-size", "512"), ("--ubatch-size", "128")):

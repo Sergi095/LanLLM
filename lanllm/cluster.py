@@ -1074,7 +1074,7 @@ def llama_server_command(config: Config, endpoints: list[str]) -> list[str]:
         "--port",
         str(config.api_port),
         "--alias",
-        config.model_id,
+        f"{config.model_id},lanllm",
         "--ctx-size",
         config.env.get("MAX_MODEL_LEN", "2048"),
         "--parallel",

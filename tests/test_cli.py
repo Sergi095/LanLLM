@@ -7,6 +7,18 @@ from unittest.mock import patch
 
 
 class ModelSelectionTests(unittest.TestCase):
+    def test_switch_accepts_llama_model_aliases(self) -> None:
+        command = runpy.run_path(str(Path(__file__).parents[1] / "bin/lanllm"))
+        wait = command["wait_for_model_ready"]
+        listing = json.dumps({
+            "data": [{"id": "lanllm", "aliases": ["lanllm", "ollama:qwen2.5:0.5b"]}]
+        }).encode()
+        with patch.dict(
+            wait.__globals__,
+            {"urlopen": lambda *_args, **_kwargs: io.BytesIO(listing)},
+        ):
+            wait({"PEER_IPS": "192.168.2.33"}, "ollama:qwen2.5:0.5b")
+
     def test_switch_waits_until_both_apis_advertise_selected_model(self) -> None:
         command = runpy.run_path(str(Path(__file__).parents[1] / "bin/lanllm"))
         wait = command["wait_for_model_ready"]

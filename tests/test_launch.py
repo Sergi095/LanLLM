@@ -44,8 +44,9 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(command[2], "/models/models/Qwen/Qwen2.5-14B-Instruct")
         self.assertEqual(
             command[command.index("--served-model-name") + 1],
-            "Qwen/Qwen2.5-14B-Instruct",
+            "lanllm",
         )
+        self.assertIn("Qwen/Qwen2.5-14B-Instruct", command)
 
     def test_model_profile_enables_goose_tools_and_existing_alias(self) -> None:
         settings = Settings.from_environment(
@@ -71,7 +72,7 @@ class LaunchTests(unittest.TestCase):
             },
         )
         command = vllm_command(settings)
-        self.assertEqual(command[command.index("--served-model-name") + 1:][:2], ["qwen3.8", "Qwen/Qwen3-8B"])
+        self.assertEqual(command[command.index("--served-model-name") + 1:][:3], ["qwen3.8", "lanllm", "Qwen/Qwen3-8B"])
         self.assertIn("--enable-auto-tool-choice", command)
         self.assertEqual(command[command.index("--tool-call-parser") + 1], "hermes")
         self.assertEqual(command[command.index("--reasoning-parser") + 1], "qwen3")
@@ -113,6 +114,39 @@ class LaunchTests(unittest.TestCase):
                     "LAYER_PARTITION": "12,12",
                 },
             )
+
+    def test_model_profile_overrides_layer_partition(self) -> None:
+        settings = Settings.from_environment(
+            "head",
+            {
+                "NODE_IP": "192.168.2.33",
+                "HEAD_IP": "192.168.2.33",
+                "NETWORK_INTERFACE": "enp12s0",
+                "LOCAL_GPUS": "2",
+                "TOTAL_GPUS": "3",
+                "MODEL_ID": "Qwen/Qwen3.8-27B-FP8",
+                "LAYER_PARTITION": "auto",
+                "MODEL_PROFILES_JSON": json.dumps({
+                    "Qwen/Qwen3.8-27B-FP8": {
+                        "layer_partition": "29,31,4",
+                        "linear_backend": "marlin",
+                        "language_model_only": True,
+                        "gpu_memory_utilization": 0.94,
+                    }
+                }),
+            },
+        )
+        self.assertEqual(settings.layer_partition, "29,31,4")
+        self.assertEqual(runtime_environment(settings)["VLLM_PP_LAYER_PARTITION"], "29,31,4")
+        self.assertEqual(
+            json.loads(vllm_command(settings)[vllm_command(settings).index("--kernel-config") + 1]),
+            {"linear_backend": "marlin"},
+        )
+        self.assertIn("--language-model-only", vllm_command(settings))
+        self.assertEqual(
+            vllm_command(settings)[vllm_command(settings).index("--gpu-memory-utilization") + 1],
+            "0.94",
+        )
 
 
 if __name__ == "__main__":

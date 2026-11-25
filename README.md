@@ -253,6 +253,10 @@ response exposes the allocated context as `meta.n_ctx` for clients that
 discover local model limits. Tool definitions and system prompts count toward
 that limit.
 
+Clients can use the stable model name `lanllm` for the currently selected
+model. The original model ID remains accepted, so clients using a specific
+model name continue to work after this change.
+
 ```bash
 curl http://<node-lan-ip>:8001/v1/models
 ```

@@ -642,7 +642,12 @@ def wait_for_model_ready(
             try:
                 with urlopen(f"http://{ip}:{port}/v1/models", timeout=3) as response:
                     listing = json.load(response)
-                if model_id in {item["id"] for item in listing["data"]}:
+                names = {
+                    name
+                    for item in listing["data"]
+                    for name in [item["id"], *item.get("aliases", [])]
+                }
+                if model_id in names:
                     ready.append(ip)
             except (OSError, ValueError, KeyError, TypeError):
                 pass
